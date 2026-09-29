@@ -1,0 +1,106 @@
+# DeployGuard CI -- Phase 3
+#
+# On every branch push:  install -> test -> build -> simulated deploy
+# and reports each step of the lifecycle back to DeployGuard:
+#
+#   RECEIVED (set by the push webhook)  ->  BUILDING  ->  SUCCESS | FAILED
+#
+# Needs two repository settings (Settings -> Secrets and variables -> Actions):
+#   Variables tab:  DEPLOYGUARD_URL           e.g. https://xxxx.ngrok-free.app
+#   Secrets tab:    DEPLOYGUARD_STATUS_TOKEN  same value as in .env.local
+# Without them the pipeline still runs; it just can't report to DeployGuard.
+#
+# Demo a failure: push a commit whose message contains [demo-fail].
+
+name: DeployGuard CI
+
+on:
+  push:
+    branches: ["**"] # every branch, but not tags
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # Explicit bash turns on pipefail, so `npm test | tee log` fails when npm test fails.
+    shell: bash
+
+jobs:
+  pipeline:
+    name: Build, test and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # The token is given ONLY to the three reporting steps below, never to
+    # install/test/build, so no dependency's script can read it.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: "DeployGuard: report BUILDING"
+        run: node scripts/report-status.mjs BUILDING
+        env:
+          DEPLOYGUARD_URL: ${{ vars.DEPLOYGUARD_URL }}
+          DEPLOYGUARD_STATUS_TOKEN: ${{ secrets.DEPLOYGUARD_STATUS_TOKEN }}
+
+      # Each stage copies its output to a log file so that, if it fails, the
+      # FAILED report can include the last lines it printed.
+      - name: Install dependencies
+        id: install
+        run: npm ci 2>&1 | tee "$RUNNER_TEMP/deployguard-install.log"
+
+      - name: Run tests
+        id: test
+        env:
+          # true only when the commit message contains [demo-fail]; see tests/demo-failure.test.mjs
+          DEPLOYGUARD_DEMO_FAILURE: ${{ contains(github.event.head_commit.message, '[demo-fail]') && '1' || '0' }}
+        run: npm test 2>&1 | tee "$RUNNER_TEMP/deployguard-test.log"
+
+      - name: Run build
+        id: build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: npm run build 2>&1 | tee "$RUNNER_TEMP/deployguard-build.log"
+
+      # MVP: no real infrastructure. This demonstrates the deployment stage of the
+      # lifecycle and checks that the build actually produced output to "deploy".
+      - name: Simulated deployment
+        id: deploy
+        run: |
+          {
+            echo "Build successful"
+            echo "Deployment started (simulated) for ${GITHUB_REPOSITORY}@${GITHUB_REF_NAME} ${GITHUB_SHA::7}"
+            if [ ! -f .next/BUILD_ID ]; then
+              echo "Deployment failed: no build output found in .next/"
+              exit 1
+            fi
+            echo "Packaging build $(cat .next/BUILD_ID) ..."
+            sleep 3
+            echo "Deployment successful (simulated)"
+          } 2>&1 | tee "$RUNNER_TEMP/deployguard-deploy.log"
+
+      - name: "DeployGuard: report SUCCESS"
+        if: success()
+        run: node scripts/report-status.mjs SUCCESS
+        env:
+          DEPLOYGUARD_URL: ${{ vars.DEPLOYGUARD_URL }}
+          DEPLOYGUARD_STATUS_TOKEN: ${{ secrets.DEPLOYGUARD_STATUS_TOKEN }}
+
+      - name: "DeployGuard: report FAILED"
+        if: failure()
+        run: node scripts/report-status.mjs FAILED
+        env:
+          DEPLOYGUARD_URL: ${{ vars.DEPLOYGUARD_URL }}
+          DEPLOYGUARD_STATUS_TOKEN: ${{ secrets.DEPLOYGUARD_STATUS_TOKEN }}
+          DEPLOYGUARD_JOB_NAME: Build, test and deploy
+          OUTCOME_INSTALL: ${{ steps.install.outcome }}
+          OUTCOME_TEST: ${{ steps.test.outcome }}
+          OUTCOME_BUILD: ${{ steps.build.outcome }}
+          OUTCOME_DEPLOY: ${{ steps.deploy.outcome }}
