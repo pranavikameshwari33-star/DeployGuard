@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { listDeployments } from "@/lib/db/deployments";
 import { buildDeploymentMemory } from "@/lib/hindsight/deployment-memory";
 import { retain } from "@/lib/hindsight/client";
+import { getViewer } from "@/lib/auth/session";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,9 +18,16 @@ export const dynamic = "force-dynamic";
  * `update_mode: "replace"`, so a deployment that already has a memory gets it
  * overwritten with identical content rather than duplicated.
  *
- *   curl -X POST http://localhost:3000/api/memory/backfill
+ *   curl -X POST -H "Authorization: Bearer $DEPLOYGUARD_STATUS_TOKEN" http://localhost:3000/api/memory/backfill
  */
 export async function POST(request: Request) {
+  // Phase 9: a maintenance tool that rewrites memories for ALL deployments, so
+  // only internal tooling may call it (Bearer DEPLOYGUARD_STATUS_TOKEN).
+  const viewer = await getViewer();
+  if (viewer?.kind !== "internal") {
+    return NextResponse.json({ error: "Internal tooling only (Bearer DEPLOYGUARD_STATUS_TOKEN)." }, { status: 401 });
+  }
+
   const limitParam = new URL(request.url).searchParams.get("limit");
   const limit = Math.min(Math.max(Number(limitParam) || 20, 1), 100);
 

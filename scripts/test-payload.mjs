@@ -48,8 +48,15 @@ export function signBody(rawBody, secret) {
   return "sha256=" + crypto.createHmac("sha256", secret).update(rawBody, "utf8").digest("hex");
 }
 
-/** POSTs a payload to the webhook endpoint with correct GitHub headers. */
-export async function deliver(url, payload, secret, eventType = "push") {
+/**
+ * POSTs a payload to the webhook endpoint with correct GitHub headers.
+ *
+ * `autoRisk` (Phase 8): verification scripts create many test pushes, and each
+ * automatic risk analysis can cost a Gemini call. So by default a scripted
+ * delivery asks the server to skip automatic analysis. The header is honoured
+ * only on a correctly signed delivery; real GitHub pushes never send it.
+ */
+export async function deliver(url, payload, secret, eventType = "push", { autoRisk = false } = {}) {
   const rawBody = JSON.stringify(payload);
   const response = await fetch(url, {
     method: "POST",
@@ -59,6 +66,7 @@ export async function deliver(url, payload, secret, eventType = "push") {
       "X-GitHub-Delivery": crypto.randomUUID(),
       "X-Hub-Signature-256": signBody(rawBody, secret),
       "User-Agent": "GitHub-Hookshot/local-test",
+      ...(autoRisk ? {} : { "X-DeployGuard-Auto-Risk": "off" }),
     },
     body: rawBody,
   });

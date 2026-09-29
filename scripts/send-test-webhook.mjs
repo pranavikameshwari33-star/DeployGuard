@@ -20,7 +20,8 @@ if (!secret) {
   process.exit(1);
 }
 
-const { status, body } = await deliver(url, buildPushPayload(), secret);
+// Behaves like a real GitHub push, including automatic risk analysis (Phase 8).
+const { status, body } = await deliver(url, buildPushPayload(), secret, "push", { autoRisk: true });
 
 console.log("Status:", status);
 console.log("Body  :", JSON.stringify(body, null, 2));

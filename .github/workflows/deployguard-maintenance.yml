@@ -1,0 +1,47 @@
+# DeployGuard maintenance -- Phase 10
+#
+# Calls DeployGuard's maintenance/reconciliation endpoint on a schedule, so no
+# long-running server process is needed. Each run is bounded and idempotent:
+# it purges expired sessions, retries unfinished webhook work, re-syncs GitHub
+# App installations and repositories, recovers missed pushes, fixes pipelines
+# whose result never arrived, and resumes stuck risk analyses.
+#
+# Uses the same repository settings as deployguard-ci.yml:
+#   Variables tab:  DEPLOYGUARD_URL
+#   Secrets tab:    DEPLOYGUARD_STATUS_TOKEN
+# Without them the job only prints a warning.
+
+name: DeployGuard maintenance
+
+on:
+  schedule:
+    - cron: "17 * * * *" # hourly, off the top of the hour
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Run DeployGuard maintenance
+        env:
+          DEPLOYGUARD_URL: ${{ vars.DEPLOYGUARD_URL }}
+          DEPLOYGUARD_STATUS_TOKEN: ${{ secrets.DEPLOYGUARD_STATUS_TOKEN }}
+        run: |
+          if [ -z "$DEPLOYGUARD_URL" ] || [ -z "$DEPLOYGUARD_STATUS_TOKEN" ]; then
+            echo "::warning title=DeployGuard::DEPLOYGUARD_URL or DEPLOYGUARD_STATUS_TOKEN is not configured; maintenance skipped."
+            exit 0
+          fi
+          # The token is sent only as a header; GitHub masks it in logs. The
+          # response contains counts and ids only.
+          status=$(curl -sS -o response.json -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer ${DEPLOYGUARD_STATUS_TOKEN}" \
+            -H "ngrok-skip-browser-warning: 1" \
+            --max-time 90 "${DEPLOYGUARD_URL%/}/api/maintenance/run" || echo "000")
+          echo "HTTP ${status}"
+          head -c 4000 response.json 2>/dev/null || true
+          if [ "$status" != "200" ]; then
+            echo "::warning title=DeployGuard::Maintenance returned HTTP ${status}."
+          fi

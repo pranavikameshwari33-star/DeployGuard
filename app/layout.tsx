@@ -1,26 +1,20 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
+import { Open_Sans } from "next/font/google";
+import "./globals.css";
+
+// The only font in the app. Self-hosted by next/font (no browser requests to Google).
+const openSans = Open_Sans({ subsets: ["latin"], display: "swap" });
 
 export const metadata: Metadata = {
   title: "DeployGuard",
-  description: "AI DevOps pipeline agent",
+  description: "Deployment monitoring and risk analysis",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en">
-      <body
-        style={{
-          fontFamily:
-            "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
-          margin: 0,
-          padding: "3rem 1.5rem",
-          background: "#0b0e14",
-          color: "#e6e9ef",
-        }}
-      >
-        {children}
-      </body>
+    <html lang="en" className={openSans.className}>
+      <body>{children}</body>
     </html>
   );
 }

@@ -1,5 +1,7 @@
+import crypto from "node:crypto";
 import { getPool } from "@/lib/db/client";
 import type { PushEvent } from "@/lib/github/parse-push-event";
+import type { ChangeAnalysis, ChangeCategory, FileAnalysis } from "@/lib/analysis/change-analysis";
 
 /**
  * The lifecycle of a deployment. The webhook creates RECEIVED (Phase 2); the
@@ -39,7 +41,21 @@ export type Deployment = {
   failure_stage: string | null;
   failure_job: string | null;
   failure_message: string | null;
+  /** Phase 5: deterministic change analysis. NULL on rows recorded before Phase 5. */
+  file_analysis: FileAnalysis[] | null;
+  change_categories: ChangeCategory[] | null;
+  affected_services: string[] | null;
+  /** Phase 8: automatic risk analysis state. NULL = never scheduled. */
+  risk_analysis_status: RiskAnalysisStatus | null;
+  risk_analysis_error: string | null;
+  risk_analysis_updated_at: Date | null;
+  /** Phase 9: the connected repository that owns this deployment (NULL = unowned / pre-Phase 9). */
+  repository_id: string | null;
+  /** Phase 9: GitHub's immutable repository id from the push payload. */
+  github_repository_id: string | null;
 };
+
+export type RiskAnalysisStatus = "pending" | "completed" | "unavailable";
 
 export type InsertResult = {
   deployment: Deployment;
@@ -51,7 +67,9 @@ const COLUMNS = `
   id, repository, owner, branch, commit_sha, commit_message, author,
   changed_files, added_files, modified_files, deleted_files, status, created_at,
   updated_at, ci_run_id, ci_run_url, ci_started_at, ci_finished_at,
-  failure_stage, failure_job, failure_message
+  failure_stage, failure_job, failure_message, file_analysis, change_categories,
+  affected_services, risk_analysis_status, risk_analysis_error, risk_analysis_updated_at,
+  repository_id, github_repository_id
 `;
 
 /**
@@ -65,16 +83,26 @@ const COLUMNS = `
  *
  * Every value is passed as a bound parameter ($1, $2, ...), never string
  * concatenation, so a commit message containing SQL is just text.
+ *
+ * The change analysis (Phase 5) is written in the same INSERT, so a deployment
+ * never exists without the analysis of its own files.
  */
-export async function insertDeployment(event: PushEvent): Promise<InsertResult> {
+export async function insertDeployment(
+  event: PushEvent,
+  analysis: ChangeAnalysis,
+  /** Phase 9: the connected repository this push belongs to; null for an unowned (plain webhook) push. */
+  repositoryId: string | null = null
+): Promise<InsertResult> {
   const pool = getPool();
 
   const inserted = await pool.query<Deployment>(
     `INSERT INTO deployments (
        repository, owner, branch, commit_sha, commit_message, author,
-       changed_files, added_files, modified_files, deleted_files, status
+       changed_files, added_files, modified_files, deleted_files, status,
+       file_analysis, change_categories, affected_services,
+       repository_id, github_repository_id
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'RECEIVED')
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'RECEIVED', $11::jsonb, $12, $13, $14, $15)
      ON CONFLICT (owner, repository, branch, commit_sha) DO NOTHING
      RETURNING ${COLUMNS}`,
     [
@@ -88,6 +116,11 @@ export async function insertDeployment(event: PushEvent): Promise<InsertResult> 
       event.addedFiles,
       event.modifiedFiles,
       event.deletedFiles,
+      JSON.stringify(analysis.files),
+      analysis.categories,
+      analysis.services,
+      repositoryId,
+      event.githubRepositoryId,
     ]
   );
 
@@ -95,22 +128,189 @@ export async function insertDeployment(event: PushEvent): Promise<InsertResult> 
     return { deployment: inserted.rows[0], isNew: true };
   }
 
-  // Conflict: this push is already in the table. Return what is stored.
+  // Conflict: this push is already in the table. If it was first recorded by a
+  // plain repository webhook (unowned) and now arrives through the GitHub App,
+  // attach the owner; ownership is never moved once set.
   const existing = await pool.query<Deployment>(
-    `SELECT ${COLUMNS} FROM deployments
-     WHERE owner = $1 AND repository = $2 AND branch = $3 AND commit_sha = $4`,
-    [event.owner, event.repository, event.branch, event.commitSha]
+    `UPDATE deployments SET
+       repository_id        = COALESCE(repository_id, $5),
+       github_repository_id = COALESCE(github_repository_id, $6)
+     WHERE owner = $1 AND repository = $2 AND branch = $3 AND commit_sha = $4
+     RETURNING ${COLUMNS}`,
+    [event.owner, event.repository, event.branch, event.commitSha, repositoryId, event.githubRepositoryId]
   );
 
   return { deployment: existing.rows[0], isNew: false };
 }
 
-/** Newest-first deployment history. Used by the verification endpoint. */
-export async function listDeployments(limit = 20): Promise<Deployment[]> {
+/** Which deployments a query may see: all (internal tooling) or those of the given repositories (Phase 9). */
+export type DeploymentScope = { all: true } | { all: false; repositoryIds: string[] };
+
+/** Newest-first deployment history, limited to the caller's scope. */
+export async function listDeployments(limit = 20, scope: DeploymentScope = { all: true }): Promise<Deployment[]> {
   const pool = getPool();
-  const result = await pool.query<Deployment>(
-    `SELECT ${COLUMNS} FROM deployments ORDER BY created_at DESC, id DESC LIMIT $1`,
-    [limit]
+  const result = scope.all
+    ? await pool.query<Deployment>(
+        `SELECT ${COLUMNS} FROM deployments ORDER BY created_at DESC, id DESC LIMIT $1`,
+        [limit]
+      )
+    : await pool.query<Deployment>(
+        `SELECT ${COLUMNS} FROM deployments WHERE repository_id = ANY($2::bigint[])
+         ORDER BY created_at DESC, id DESC LIMIT $1`,
+        [limit, scope.repositoryIds]
+      );
+  return result.rows;
+}
+
+/**
+ * Phase 8: marks automatic risk analysis as pending and returns a token that
+ * identifies this attempt. Only the holder of the newest token may record the
+ * outcome (see finishRiskAnalysis).
+ */
+export async function startRiskAnalysis(deploymentId: string): Promise<string> {
+  const attempt = crypto.randomUUID();
+  await getPool().query(
+    `UPDATE deployments
+     SET risk_analysis_status = 'pending', risk_analysis_error = NULL,
+         risk_analysis_updated_at = now(), risk_analysis_attempt = $2
+     WHERE id = $1`,
+    [deploymentId, attempt]
+  );
+  return attempt;
+}
+
+/**
+ * Records how an attempt ended -- unless a newer attempt has started since, in
+ * which case this (older) outcome is dropped and the newer one will report.
+ */
+export async function finishRiskAnalysis(
+  deploymentId: string,
+  attempt: string,
+  outcome: { status: "completed" } | { status: "unavailable"; error: string }
+): Promise<boolean> {
+  const result = await getPool().query(
+    `UPDATE deployments
+     SET risk_analysis_status = $3, risk_analysis_error = $4, risk_analysis_updated_at = now()
+     WHERE id = $1 AND risk_analysis_attempt = $2`,
+    [deploymentId, attempt, outcome.status, outcome.status === "unavailable" ? outcome.error.slice(0, 500) : null]
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * Phase 10: automatic analyses left "pending" for too long -- their after()
+ * callback was lost (timeout, crash, restart). The maintenance run resumes them.
+ */
+export async function listStuckRiskAnalyses(olderThanMinutes: number, limit: number): Promise<string[]> {
+  const result = await getPool().query<{ id: string }>(
+    `SELECT id FROM deployments
+     WHERE risk_analysis_status = 'pending' AND risk_analysis_updated_at < now() - make_interval(mins => $1)
+     ORDER BY risk_analysis_updated_at LIMIT $2`,
+    [olderThanMinutes, limit]
+  );
+  return result.rows.map((r) => r.id);
+}
+
+/**
+ * Phase 10: owned deployments whose pipeline result never arrived (still
+ * RECEIVED/BUILDING after `staleMinutes`), with what is needed to ask GitHub.
+ */
+export async function listStaleOwnedDeployments(
+  staleMinutes: number,
+  maxAgeHours: number,
+  limit: number
+): Promise<(Deployment & { installation_id: string; full_name: string })[]> {
+  const result = await getPool().query<Deployment & { installation_id: string; full_name: string }>(
+    `SELECT d.*, r.installation_id, r.full_name
+     FROM deployments d
+     JOIN repositories r ON r.id = d.repository_id
+     JOIN github_installations i ON i.installation_id = r.installation_id
+     WHERE d.status IN ('RECEIVED', 'BUILDING') AND r.connected AND i.status = 'active'
+       AND d.updated_at < now() - make_interval(mins => $1)
+       AND d.created_at > now() - make_interval(hours => $2)
+     ORDER BY d.created_at DESC LIMIT $3`,
+    [staleMinutes, maxAgeHours, limit]
+  );
+  return result.rows;
+}
+
+/** Phase 10: whether a push (repository/branch/commit) has already been recorded. */
+export async function deploymentExists(owner: string, repository: string, branch: string, commitSha: string): Promise<boolean> {
+  const result = await getPool().query(
+    `SELECT 1 FROM deployments WHERE owner = $1 AND repository = $2 AND branch = $3 AND commit_sha = $4`,
+    [owner, repository, branch, commitSha]
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+/** One deployment by id, or null. */
+export async function getDeploymentById(id: string): Promise<Deployment | null> {
+  const result = await getPool().query<Deployment>(
+    `SELECT ${COLUMNS} FROM deployments WHERE id = $1`,
+    [id]
+  );
+  return result.rows[0] ?? null;
+}
+
+/** A past deployment plus its incident (Phase 4), if it has one. */
+export type HistoricalDeployment = Deployment & {
+  incident_id: string | null;
+  incident_failure_type: string | null;
+  incident_error_message: string | null;
+  incident_root_cause: string | null;
+  incident_resolution: string | null;
+};
+
+/**
+ * Phase 6: earlier deployments of the same repository that COULD be similar to
+ * `current` -- they share a changed file, an informative category or a service
+ * (the GIN indexes make these overlaps cheap), or Hindsight named them. Rows
+ * recorded before Phase 5 have no stored analysis, so they are included and the
+ * caller analyses their file lists. Scoring happens in lib/similarity.
+ *
+ * Only deployments recorded no later than `current` count as history, and
+ * `current` itself is always excluded.
+ */
+export async function findHistoryCandidates(
+  current: Deployment,
+  signals: { categories: string[]; services: string[]; extraIds: string[] },
+  limit = 500
+): Promise<HistoricalDeployment[]> {
+  const result = await getPool().query<HistoricalDeployment>(
+    `SELECT d.*,
+            i.id            AS incident_id,
+            i.failure_type  AS incident_failure_type,
+            i.error_message AS incident_error_message,
+            i.root_cause    AS incident_root_cause,
+            i.resolution    AS incident_resolution
+     FROM deployments d
+     LEFT JOIN incidents i ON i.deployment_id = d.id
+     WHERE d.owner = $1 AND d.repository = $2
+       -- Phase 9: history never crosses an ownership boundary. An owned
+       -- deployment only sees deployments of the SAME connected repository;
+       -- an unowned one only sees unowned ones.
+       AND d.repository_id IS NOT DISTINCT FROM $10::bigint
+       AND d.id <> $3
+       AND d.created_at <= $4
+       AND (   d.changed_files     && $5::text[]
+            OR d.change_categories && $6::text[]
+            OR d.affected_services && $7::text[]
+            OR d.file_analysis IS NULL
+            OR d.id = ANY($8::bigint[]))
+     ORDER BY d.created_at DESC, d.id DESC
+     LIMIT $9`,
+    [
+      current.owner,
+      current.repository,
+      current.id,
+      current.created_at,
+      current.changed_files,
+      signals.categories,
+      signals.services,
+      signals.extraIds,
+      limit,
+      current.repository_id,
+    ]
   );
   return result.rows;
 }

@@ -45,6 +45,7 @@ export function buildDeploymentMemory(deployment: Deployment): MemoryItem {
     metadata: {
       kind: "deployment",
       deployment_id: deployment.id,
+      ...(deployment.github_repository_id ? { github_repository_id: deployment.github_repository_id } : {}),
       repository: deployment.repository,
       owner: deployment.owner,
       repository_full_name: repo,
@@ -60,6 +61,12 @@ export function buildDeploymentMemory(deployment: Deployment): MemoryItem {
         : {}),
       ...(deployment.failure_stage ? { failure_stage: deployment.failure_stage } : {}),
       ...(deployment.failure_job ? { failure_job: deployment.failure_job } : {}),
+      ...(deployment.change_categories
+        ? {
+            change_categories: deployment.change_categories.join(","),
+            affected_services: (deployment.affected_services ?? []).join(","),
+          }
+        : {}),
     },
   };
 }
@@ -91,10 +98,38 @@ function buildContent(deployment: Deployment, repo: string, shortSha: string): s
     lines.push(`Areas of the repository touched: ${areas.join(", ")}.`);
   }
 
+  lines.push(...changeAnalysisLines(deployment));
+
   lines.push(`Recorded by DeployGuard at ${deployment.created_at.toISOString()}.`);
   lines.push(pipelineOutcome(deployment));
 
   return lines.join("\n");
+}
+
+/**
+ * Phase 5: the deterministic change analysis, verbatim. Rows recorded before
+ * Phase 5 have no analysis and get no lines, rather than an invented one.
+ */
+function changeAnalysisLines(deployment: Deployment): string[] {
+  if (!deployment.file_analysis || !deployment.change_categories) return [];
+
+  const services = deployment.affected_services ?? [];
+  const lines = [
+    `Change categories (deterministic path analysis): ${deployment.change_categories.join(", ") || "none"}.`,
+    services.length
+      ? `Affected services/components: ${services.join(", ")}.`
+      : "Affected services/components: none could be determined from the file paths.",
+    "Per-file change analysis:",
+  ];
+
+  for (const file of deployment.file_analysis.slice(0, MAX_FILES_IN_TEXT)) {
+    const service = file.service ? `; service/component ${file.service}` : "";
+    lines.push(`- ${file.change_type} ${file.path}: ${file.categories.join(", ")}${service}`);
+  }
+  if (deployment.file_analysis.length > MAX_FILES_IN_TEXT) {
+    lines.push(`- and ${deployment.file_analysis.length - MAX_FILES_IN_TEXT} more file(s)`);
+  }
+  return lines;
 }
 
 /** What the CI pipeline reported, and nothing more. */
@@ -130,6 +165,16 @@ function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)} ... (truncated)`;
 }
 
+/**
+ * Phase 9 tenant scope: GitHub's immutable repository id. A signed-in user's
+ * recall is always restricted to the ghrepo: tags of their own repositories, so
+ * one user can never recall another user's history. (Repository names can be
+ * renamed or re-created by someone else; the id cannot.)
+ */
+export function repositoryScopeTags(deployment: { github_repository_id: string | null }): string[] {
+  return deployment.github_repository_id ? [`ghrepo:${deployment.github_repository_id}`] : [];
+}
+
 function buildTags(deployment: Deployment, repo: string, shortSha: string): string[] {
   return [
     "deployment",
@@ -140,6 +185,9 @@ function buildTags(deployment: Deployment, repo: string, shortSha: string): stri
     `commit:${shortSha}`,
     `author:${deployment.author}`,
     ...topLevelAreas(deployment.changed_files).map((area) => `area:${area}`),
+    ...repositoryScopeTags(deployment),
+    ...(deployment.change_categories ?? []).map((category) => `category:${category}`),
+    ...(deployment.affected_services ?? []).map((service) => `service:${service}`),
   ];
 }
 

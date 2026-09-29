@@ -10,7 +10,13 @@
     "test:webhook": "node scripts/send-test-webhook.mjs",
     "db:migrate": "node scripts/migrate.mjs",
     "verify:phase2": "node scripts/verify-phase2.mjs",
-    "verify:phase3": "node scripts/verify-phase3.mjs"
+    "verify:phase3": "node scripts/verify-phase3.mjs",
+    "verify:phase4": "node scripts/verify-phase4.mjs",
+    "verify:phase5": "node --experimental-strip-types scripts/verify-phase5.mjs",
+    "verify:phase6": "node scripts/verify-phase6.mjs",
+    "verify:phase7": "node --experimental-strip-types scripts/verify-phase7.mjs",
+    "verify:phase8": "node scripts/verify-phase8.mjs",
+    "verify:phase9": "node scripts/verify-phase9.mjs"
   },
   "dependencies": {
     "next": "^16.3.6",

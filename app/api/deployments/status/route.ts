@@ -1,14 +1,8 @@
-import crypto from "node:crypto";
 import { NextResponse } from "next/server";
 import { env } from "@/lib/env";
-import {
-  updateDeploymentStatus,
-  type DeploymentKey,
-  type PipelineStatus,
-  type StatusUpdate,
-} from "@/lib/db/deployments";
-import { buildDeploymentMemory } from "@/lib/hindsight/deployment-memory";
-import { retain } from "@/lib/hindsight/client";
+import { isAuthorized } from "@/lib/auth/bearer-token";
+import type { DeploymentKey, PipelineStatus, StatusUpdate } from "@/lib/db/deployments";
+import { applyPipelineStatus } from "@/lib/pipeline/apply-status";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -38,6 +32,8 @@ export const dynamic = "force-dynamic";
  *   validation  -> 400, nothing changes.
  *   database    -> 404 no such deployment, 409 status move not allowed,
  *                  500 database error.
+ *   incident    -> FAILED only (Phase 4): one incident row per deployment.
+ *                  500 if it cannot be written, so the pipeline retries.
  *   memory      -> 200. The status is already saved in the database; a
  *                  Hindsight outage must not undo or hide that.
  */
@@ -83,10 +79,11 @@ export async function POST(request: Request) {
   const { key, update } = parsed;
   const label = `${key.owner}/${key.repository}@${key.branch} ${key.commitSha.slice(0, 7)}`;
 
-  // ---------- stage 3: database (source of truth) ----------
+  // ---------- stages 3-6: status, incident, memory, risk refresh ----------
+  // Shared with the GitHub App's workflow_run handling (lib/pipeline/apply-status.ts).
   let result;
   try {
-    result = await updateDeploymentStatus(key, update);
+    result = await applyPipelineStatus(key, update, "ci");
   } catch (error) {
     const message = (error as Error).message;
     console.error(`[DeployGuard][db] Failed to update status for ${label}: ${message}`);
@@ -97,7 +94,6 @@ export async function POST(request: Request) {
   }
 
   if (result.outcome === "not_found") {
-    console.warn(`[DeployGuard][ci] No deployment for ${label} (status ${update.status} not applied).`);
     return NextResponse.json(
       {
         ok: false,
@@ -111,9 +107,6 @@ export async function POST(request: Request) {
   }
 
   if (result.outcome === "invalid_transition") {
-    console.warn(
-      `[DeployGuard][ci] Refused ${result.currentStatus} -> ${update.status} for ${label}.`
-    );
     return NextResponse.json(
       {
         ok: false,
@@ -125,57 +118,42 @@ export async function POST(request: Request) {
     );
   }
 
-  const { deployment, previousStatus } = result;
-  console.log(
-    `[DeployGuard][ci] Deployment #${deployment.id} ${label}: ${previousStatus} -> ${deployment.status}` +
-      (deployment.failure_stage ? ` (failed stage: ${deployment.failure_stage})` : "")
-  );
-
-  // ---------- stage 4: agent memory (best effort, final results only) ----------
-  // BUILDING is a passing moment and is not worth remembering. The final result
-  // REPLACES the memory the webhook wrote (same document_id), so each deployment
-  // stays one memory.
-  let memory: { stored: boolean; error?: string } | { skipped: string } = {
-    skipped: "Only final results (SUCCESS / FAILED) are written to Hindsight.",
-  };
-
-  if (deployment.status === "SUCCESS" || deployment.status === "FAILED") {
-    try {
-      await retain(buildDeploymentMemory(deployment));
-      memory = { stored: true };
-      console.log(`[DeployGuard][memory] Updated deployment #${deployment.id} in Hindsight (${deployment.status}).`);
-    } catch (error) {
-      memory = { stored: false, error: (error as Error).message };
-      console.error(
-        `[DeployGuard][memory] Hindsight write FAILED for deployment #${deployment.id}: ${memory.error}\n` +
-          `             The ${deployment.status} status IS saved in the database. Re-store it later with: curl -X POST http://localhost:3000/api/memory/backfill`
-      );
-    }
+  // A database error on the incident returns 500 so the pipeline retries; the
+  // retry is safe because FAILED -> FAILED is allowed and the incident write is idempotent.
+  if (result.outcome === "incident_error") {
+    return NextResponse.json(
+      {
+        ok: false,
+        stage: "incident",
+        error: "The FAILED status was saved, but the incident record could not be written.",
+        detail: result.message,
+        deploymentId: result.deployment.id,
+      },
+      { status: 500 }
+    );
   }
 
+  const { deployment, previousStatus, incident, incidentMemory, memory } = result;
   return NextResponse.json({
     ok: true,
     stage: "database",
+    riskAnalysis: result.riskRefreshScheduled ? "refresh scheduled" : "not scheduled",
     deploymentId: deployment.id,
     previousStatus,
     status: deployment.status,
     failure: deployment.failure_stage
       ? { stage: deployment.failure_stage, job: deployment.failure_job }
       : undefined,
+    incident: incident
+      ? {
+          id: incident.incident.id,
+          created: incident.isNew,
+          failureType: incident.incident.failure_type,
+          memory: incidentMemory,
+        }
+      : undefined,
     memory,
   });
-}
-
-/**
- * Compares the bearer token in constant time. Both sides are hashed first so
- * they are always the same length, which timingSafeEqual requires, without
- * revealing the real token's length.
- */
-function isAuthorized(header: string | null, expected: string): boolean {
-  if (!header?.startsWith("Bearer ")) return false;
-  const received = header.slice("Bearer ".length).trim();
-  const digest = (value: string) => crypto.createHash("sha256").update(value, "utf8").digest();
-  return crypto.timingSafeEqual(digest(received), digest(expected));
 }
 
 const PIPELINE_STATUSES: PipelineStatus[] = ["BUILDING", "SUCCESS", "FAILED"];

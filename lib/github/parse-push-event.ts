@@ -30,6 +30,7 @@ type GithubPushPayload = {
   forced?: boolean;
   compare?: string;
   repository?: {
+    id?: number;
     name?: string;
     full_name?: string;
     html_url?: string;
@@ -39,6 +40,8 @@ type GithubPushPayload = {
   pusher?: { name?: string; email?: string };
   head_commit?: GithubCommit | null;
   commits?: GithubCommit[];
+  /** Present when the push was delivered to the GitHub App (Phase 9). */
+  installation?: { id?: number };
 };
 
 /** The normalized push event that the rest of DeployGuard works with. */
@@ -66,6 +69,10 @@ export type PushEvent = {
   modifiedFiles: string[];
   deletedFiles: string[];
   changedFiles: string[];
+
+  /** Phase 9: GitHub's immutable repository id, and the App installation that delivered the push (null for a plain repo webhook). */
+  githubRepositoryId: number | null;
+  installationId: number | null;
 };
 
 /**
@@ -153,5 +160,8 @@ export function parsePushEvent(
     compareUrl: push.compare ?? "",
 
     ...files,
+
+    githubRepositoryId: typeof push.repository?.id === "number" ? push.repository.id : null,
+    installationId: typeof push.installation?.id === "number" ? push.installation.id : null,
   };
 }

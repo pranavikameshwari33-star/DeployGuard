@@ -33,4 +33,18 @@ export const env = {
   hindsightBankId: () => optional("HINDSIGHT_BANK_ID", "DeployGuard"),
   /** Shared with GitHub Actions so only our own pipeline can change a deployment's status. */
   deployguardStatusToken: () => required("DEPLOYGUARD_STATUS_TOKEN"),
+  /** Phase 7: risk analysis. The key is sent only as a request header, never in a URL. */
+  geminiApiKey: () => required("GEMINI_API_KEY"),
+  /**
+   * Pinned to a stable model (not a moving "-latest" alias) so behaviour does not
+   * change silently. Override with GEMINI_MODEL, e.g. gemini-3.5-flash.
+   */
+  geminiModel: () => optional("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+
+  // --- Phase 9: GitHub App (login + repository connection) ---
+  githubAppId: () => required("GITHUB_APP_ID"),
+  githubAppClientId: () => required("GITHUB_APP_CLIENT_ID"),
+  githubAppClientSecret: () => required("GITHUB_APP_CLIENT_SECRET"),
+  /** Accepts a multi-line PEM or a single line with escaped "\n" sequences. */
+  githubAppPrivateKey: () => required("GITHUB_APP_PRIVATE_KEY").replace(/\\n/g, "\n"),
 };

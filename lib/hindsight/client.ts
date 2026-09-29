@@ -99,7 +99,13 @@ export type RecallResponse = { results: RecallResult[] };
 /** Semantic search over a bank's memories. */
 export async function recall(
   query: string,
-  options: { bankId?: string; maxTokens?: number; tags?: string[] } = {}
+  options: {
+    bankId?: string;
+    maxTokens?: number;
+    tags?: string[];
+    /** 'any' also returns untagged memories; 'any_strict' returns only memories carrying one of the tags. */
+    tagsMatch?: "any" | "any_strict";
+  } = {}
 ) {
   const bankId = options.bankId ?? env.hindsightBankId();
   return post<RecallResponse>(
@@ -108,7 +114,7 @@ export async function recall(
       query,
       max_tokens: options.maxTokens ?? 2048,
       budget: "mid",
-      ...(options.tags?.length ? { tags: options.tags, tags_match: "any" } : {}),
+      ...(options.tags?.length ? { tags: options.tags, tags_match: options.tagsMatch ?? "any" } : {}),
     }
   );
 }

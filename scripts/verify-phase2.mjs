@@ -15,6 +15,7 @@
  */
 import pg from "pg";
 import { loadEnv } from "./load-env.mjs";
+import { internalFetch } from "./internal-fetch.mjs";
 import { buildPushPayload, deliver } from "./test-payload.mjs";
 
 loadEnv();
@@ -110,7 +111,7 @@ try {
   else fail("memory was not written", first.body.memory?.error ?? "unknown reason");
 
   const query = "deployment that changed the database configuration";
-  const recallResponse = await fetch(
+  const recallResponse = await internalFetch(
     `${BASE}/api/memory/recall?q=${encodeURIComponent(query)}`
   );
   const recalled = await recallResponse.json();
