@@ -9,7 +9,15 @@ export async function waitForJob(client, jobId, timeoutMs = 60_000) {
   if (!jobId) return null;
   const until = Date.now() + timeoutMs;
   while (Date.now() < until) {
-    const { rows } = await client.query(`SELECT status, attempts, last_error FROM jobs WHERE id = $1`, [jobId]);
+    let rows;
+    try {
+      ({ rows } = await client.query(`SELECT status, attempts, last_error FROM jobs WHERE id = $1`, [jobId]));
+    } catch (error) {
+      // A hosted pooler can drop an idle connection; the next poll uses a fresh one.
+      if (!/Connection terminated|ECONNRESET|timeout/i.test(error.message)) throw error;
+      await sleep(1000);
+      continue;
+    }
     if (!rows[0]) return { status: "missing" };
     if (rows[0].status === "succeeded" || rows[0].status === "dead") return rows[0];
     await sleep(1000);

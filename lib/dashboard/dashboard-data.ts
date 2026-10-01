@@ -3,13 +3,13 @@ import { redactDeep, redactNullable, redactText } from "@/lib/security/redact";
 import { safeGithubUrl } from "@/lib/security/untrusted";
 import {
   getDeploymentById,
-  listDeployments,
   type Deployment,
   type DeploymentScope,
   type DeploymentStatus,
   type RiskAnalysisStatus,
 } from "@/lib/db/deployments";
-import { getIncidentForDeployment, listIncidents, type Incident, type IncidentListItem } from "@/lib/db/incidents";
+import { getIncidentForDeployment, type Incident, type IncidentListItem } from "@/lib/db/incidents";
+import { historyCounts, listDeploymentsPage, listIncidentsScoped, type HistoryCounts, type ViewScope } from "@/lib/dashboard/queries";
 import {
   getLatestAssessment,
   getLatestRiskLevels,
@@ -30,6 +30,8 @@ import { findSimilarDeployments } from "@/lib/similarity/find-similar";
 export type DashboardDeployment = {
   id: string;
   repository: string;
+  /** Stage 3: the immutable GitHub repository id (switcher context, connection state). */
+  github_repository_id: string | null;
   branch: string;
   commit_sha: string;
   commit_message: string;
@@ -59,12 +61,29 @@ export type RiskView =
       note: string | null;
     }
   | { state: "pending" }
-  | { state: "unavailable"; error: string | null }
+  | { state: "unavailable"; error: string | null; kind: UnavailableKind }
   | { state: "not_analysed" };
+
+/** Stage 3: why an analysis is unavailable, in words a user can act on. */
+export type UnavailableKind = "usage_limit" | "invalid_answer" | "model_unavailable" | "other";
+
+export function unavailableKind(error: string | null): UnavailableKind {
+  if (!error) return "other";
+  if (/usage limit/i.test(error)) return "usage_limit";
+  if (/failed validation|not valid JSON|no output/i.test(error)) return "invalid_answer";
+  if (/gemini|could not reach|did not answer|timeout|responded 5dd|rate/i.test(error)) return "model_unavailable";
+  return "other";
+}
 
 export type SelectedDeployment = {
   deployment: DashboardDeployment;
   risk: RiskView;
+  /**
+   * Stage 3: whether to OFFER Re-analyze. Only when the result is missing,
+   * unavailable or older than the current pipeline state, and the change
+   * analysis exists (there is evidence to analyse). Never automatic.
+   */
+  reanalyze: { offered: boolean; why: string };
   incident: Incident | null;
   evidence: {
     /** "assessment": exactly what the risk analysis saw. "database": current structured matches (no analysis yet). */
@@ -93,6 +112,10 @@ export type DashboardData = {
   notFound: boolean;
   history: HistoryRow[];
   incidents: IncidentListItem[];
+  /** Stage 3: plain counts over every deployment in the current scope. */
+  counts: HistoryCounts;
+  /** Stage 3: history paging. */
+  page: { offset: number; limit: number; hasMore: boolean };
 };
 
 export async function getDashboardData(
@@ -101,13 +124,24 @@ export async function getDashboardData(
     historyLimit?: number;
     /** Phase 9: the viewer's scope. Everything below is limited to it. */
     scope?: DeploymentScope;
+    /** Stage 3: repository switcher -- narrows the scope to one repository (ANDed in SQL). */
+    githubRepositoryId?: string | null;
+    /** Stage 3: history paging. */
+    historyOffset?: number;
   } = {}
 ): Promise<DashboardData> {
   const scope: DeploymentScope = options.scope ?? { all: true };
-  const [recent, incidents] = await Promise.all([
-    listDeployments(options.historyLimit ?? 25, scope),
-    listIncidents(20, scope),
+  const view: ViewScope = { scope, githubRepositoryId: options.githubRepositoryId ?? null };
+  const limit = options.historyLimit ?? 25;
+  const offset = Math.max(0, options.historyOffset ?? 0);
+  // One extra row tells whether there is an older page.
+  const [page, incidents, counts, latest] = await Promise.all([
+    listDeploymentsPage(view, limit + 1, offset),
+    listIncidentsScoped(view, 20),
+    historyCounts(view),
+    offset > 0 && !options.deploymentId ? listDeploymentsPage(view, 1, 0) : Promise.resolve(null),
   ]);
+  const recent = page.slice(0, limit);
   const levels = await getLatestRiskLevels(recent.map((d) => d.id));
 
   const history: HistoryRow[] = recent.map((d) => ({
@@ -131,7 +165,7 @@ export async function getDashboardData(
     if (current && !scope.all && (!current.repository_id || !scope.repositoryIds.includes(current.repository_id))) {
       current = null;
     }
-  } else current = recent[0] ?? null;
+  } else current = (latest ?? recent)[0] ?? null;
 
   // Stage 1: one last redaction pass over everything the page will render
   // (incident output, historical matches, assessment text), covering rows
@@ -141,6 +175,8 @@ export async function getDashboardData(
     notFound: Boolean(options.deploymentId) && !current,
     history,
     incidents,
+    counts,
+    page: { offset, limit, hasMore: page.length > limit },
   }).value;
 }
 
@@ -160,13 +196,32 @@ async function describe(d: Deployment): Promise<SelectedDeployment> {
     evidence = { source: "database", matches: (similar?.matches ?? []).map(toEvidenceMatch) };
   }
 
-  return { deployment: toDashboardDeployment(d), risk: riskView(d, assessment), incident, evidence };
+  const risk = riskView(d, assessment);
+  return { deployment: toDashboardDeployment(d), risk, incident, evidence, reanalyze: reanalyzeOffer(d, risk) };
+}
+
+function reanalyzeOffer(d: Deployment, risk: RiskView): SelectedDeployment["reanalyze"] {
+  if (!d.file_analysis) return { offered: false, why: "No change analysis is recorded for this deployment, so there is nothing to analyse." };
+  if (d.risk_analysis_status === "pending" || risk.state === "pending") return { offered: false, why: "An analysis is already running." };
+  if (risk.state === "not_analysed") return { offered: true, why: "This deployment has not been analysed." };
+  if (risk.state === "unavailable") {
+    return risk.kind === "usage_limit"
+      ? { offered: false, why: "The usage limit for this repository has been reached." }
+      : { offered: true, why: "The last analysis attempt was unavailable." };
+  }
+  if (d.risk_analysis_status === "unavailable" && unavailableKind(d.risk_analysis_error) !== "usage_limit") {
+    return { offered: true, why: "The latest refresh was unavailable; the assessment shown is older." };
+  }
+  if (risk.basedOnPipeline !== d.status) return { offered: true, why: `The assessment was made when the pipeline was ${risk.basedOnPipeline}; it is now ${d.status}.` };
+  return { offered: false, why: "The assessment is current for this evidence." };
 }
 
 function riskView(d: Deployment, assessment: StoredRiskAssessment | null): RiskView {
   if (!assessment) {
     if (d.risk_analysis_status === "pending") return { state: "pending" };
-    if (d.risk_analysis_status === "unavailable") return { state: "unavailable", error: d.risk_analysis_error };
+    if (d.risk_analysis_status === "unavailable") {
+      return { state: "unavailable", error: d.risk_analysis_error, kind: unavailableKind(d.risk_analysis_error) };
+    }
     return { state: "not_analysed" };
   }
 
@@ -186,6 +241,7 @@ function toDashboardDeployment(d: Deployment): DashboardDeployment {
   return {
     id: d.id,
     repository: `${d.owner}/${d.repository}`,
+    github_repository_id: d.github_repository_id,
     branch: d.branch,
     commit_sha: d.commit_sha,
     commit_message: firstLine(d.commit_message),

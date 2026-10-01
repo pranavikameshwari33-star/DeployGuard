@@ -50,18 +50,24 @@ export async function GET(request: Request) {
     if (limited) return limited;
     githubRepositoryIds = viewer.repositories.map((r) => r.github_repository_id);
   } else {
-    // Internal tooling: every repository DeployGuard knows. A deployment:<id> or
-    // commit:<sha> filter is first resolved to that deployment's own repository,
-    // so a narrowed recall stays a single-tenant query.
+    // Internal tooling: every repository DeployGuard knows. A filter that names
+    // a specific record -- deployment:<id>, commit:<sha>, incident:<id> or
+    // repo:<owner/name> -- is first resolved to that record's own repository,
+    // so a narrowed recall stays a precise single-tenant query.
     const deploymentIds = tags.flatMap((t) => (/^deployment:\d{1,19}$/.test(t) ? [t.slice(11)] : []));
     const shas = tags.flatMap((t) => (/^commit:[0-9a-f]{7,40}$/i.test(t) ? [t.slice(7).toLowerCase()] : []));
+    const incidentIds = tags.flatMap((t) => (/^incident:\d{1,19}$/.test(t) ? [t.slice(9)] : []));
+    const repoNames = tags.flatMap((t) => (/^repo:[\w.-]+\/[\w.-]+$/.test(t) ? [t.slice(5)] : []));
     const known =
-      deploymentIds.length || shas.length
+      deploymentIds.length || shas.length || incidentIds.length || repoNames.length
         ? await getPool().query<{ id: string }>(
-            `SELECT DISTINCT github_repository_id::text AS id FROM deployments
-             WHERE github_repository_id IS NOT NULL
-               AND (id = ANY($1::bigint[]) OR left(commit_sha, 7) = ANY($2::text[]))`,
-            [deploymentIds, shas.map((s) => s.slice(0, 7))]
+            `SELECT DISTINCT d.github_repository_id::text AS id FROM deployments d
+             WHERE d.github_repository_id IS NOT NULL
+               AND (d.id = ANY($1::bigint[])
+                    OR left(d.commit_sha, 7) = ANY($2::text[])
+                    OR d.id IN (SELECT deployment_id FROM incidents WHERE id = ANY($3::bigint[]))
+                    OR d.owner || '/' || d.repository = ANY($4::text[]))`,
+            [deploymentIds, shas.map((s) => s.slice(0, 7)), incidentIds, repoNames]
           )
         : await getPool().query<{ id: string }>(
             `SELECT github_repository_id::text AS id FROM repositories

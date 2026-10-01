@@ -358,6 +358,10 @@ export type UserRepository = {
    * was uninstalled. History is kept in both cases.
    */
   connection_state: "CONNECTED" | "DISCONNECTED" | "SUSPENDED";
+  /** Stage 3: for the "manage on GitHub" link. */
+  installation_id: string;
+  account_login: string | null;
+  account_type: string | null;
 };
 
 /** Every repository the user owns through their installations, monitored or not (history stays theirs). */
@@ -367,7 +371,8 @@ export async function listUserRepositories(userId: string): Promise<UserReposito
             (r.connected AND i.status = 'active') AS monitoring, i.status AS installation_status,
             CASE WHEN i.status = 'suspended' AND r.connected THEN 'SUSPENDED'
                  WHEN r.connected AND i.status = 'active' THEN 'CONNECTED'
-                 ELSE 'DISCONNECTED' END AS connection_state
+                 ELSE 'DISCONNECTED' END AS connection_state,
+            r.installation_id::text AS installation_id, i.github_account_login AS account_login, i.account_type
      FROM repositories r JOIN github_installations i ON i.installation_id = r.installation_id
      WHERE i.user_id = $1
      ORDER BY (r.connected AND i.status = 'active') DESC, r.full_name`,

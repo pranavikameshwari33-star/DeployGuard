@@ -1,16 +1,23 @@
 import { redirect } from "next/navigation";
 import { getDashboardData } from "@/lib/dashboard/dashboard-data";
+import { getIncidentDetail, listRepositoryOptions, type RepositoryOption } from "@/lib/dashboard/queries";
+import { recallForDeployment, type RecalledMemory as RecalledMemoryData } from "@/lib/dashboard/recalled";
+import { getDeploymentById } from "@/lib/db/deployments";
 import { getViewer, scopeOf } from "@/lib/auth/session";
 import { AutoRefresh } from "./_components/auto-refresh";
 import { absoluteTime } from "./_components/format";
+import { makeLinks } from "./_components/links";
 import {
   ChangeAnalysis,
   ConnectedRepositories,
   CurrentDeployment,
   DeploymentHistory,
   HistoricalEvidence,
+  IncidentDetail,
   IncidentHistory,
   PipelinePanel,
+  RecalledMemory,
+  RepositorySwitcher,
   RiskPanel,
 } from "./_components/sections";
 
@@ -26,14 +33,20 @@ const CONNECT_MESSAGES: Record<string, string> = {
   error: "The repository connection could not be completed. Please try again.",
 };
 
+const isId = (v: unknown): v is string => typeof v === "string" && /^\d{1,19}$/.test(v);
+
 /**
- * The DeployGuard dashboard (Phase 8, scoped per user since Phase 9).
+ * The DeployGuard dashboard (Phase 8; scoped per user since Phase 9; Stage 3
+ * adds the repository switcher, evidence trace, incident detail and states).
  *
- * Server-rendered from getDashboardData(), which reads PostgreSQL only: no
- * credentials reach the browser, and loading or refreshing this page never
- * calls Gemini. A signed-in user sees only their connected repositories;
- * anonymous visitors are sent to /login. `?id=<deploymentId>` shows a
- * specific deployment.
+ * Server-rendered from PostgreSQL: no credentials reach the browser, and
+ * loading or refreshing this page never calls Gemini. Hindsight is only asked
+ * when the user explicitly clicks "Show recalled memory" (?memory=1).
+ *
+ *   ?repo=<GitHub repository id>   narrow everything to one of YOUR repositories
+ *   ?id=<deployment id>            show a specific deployment
+ *   ?incident=<incident id>        incident detail
+ *   ?offset=<n>                    history paging
  */
 export default async function Dashboard({
   searchParams,
@@ -44,14 +57,41 @@ export default async function Dashboard({
   if (!viewer) redirect("/login");
 
   const params = await searchParams;
-  const raw = params.id;
-  const requested = typeof raw === "string" && /^\d{1,19}$/.test(raw) ? raw : undefined;
-  const connect = typeof params.connect === "string" ? CONNECT_MESSAGES[params.connect] : undefined;
-
-  const data = await getDashboardData({ deploymentId: requested, scope: scopeOf(viewer) });
-  const selected = data.selected;
   const user = viewer.kind === "user" ? viewer : null;
+  const scope = scopeOf(viewer);
+
+  // Repository switcher: options are the viewer's own repositories (users) or every known repository (internal).
+  const options: RepositoryOption[] = user
+    ? user.repositories.map((r) => ({ github_repository_id: String(r.github_repository_id), full_name: r.full_name }))
+    : await listRepositoryOptions();
+  const requestedRepo = isId(params.repo) ? params.repo : null;
+  // A repository that is not one of the viewer's is ignored (and said so), never shown.
+  const repo = requestedRepo && options.some((o) => o.github_repository_id === requestedRepo) ? requestedRepo : null;
+  const repoName = repo ? options.find((o) => o.github_repository_id === repo)?.full_name ?? null : null;
+  const links = makeLinks(repo);
+
+  const requested = isId(params.id) ? params.id : undefined;
+  const incidentId = isId(params.incident) ? params.incident : undefined;
+  const offset = isId(params.offset) ? Math.min(Number(params.offset), 100_000) : 0;
+  const connect = typeof params.connect === "string" ? CONNECT_MESSAGES[params.connect] : undefined;
   const hasRepositories = !user || user.repositories.length > 0;
+
+  const incident = incidentId ? await getIncidentDetail(incidentId, { scope, githubRepositoryId: repo }) : null;
+  const data = incidentId
+    ? null
+    : await getDashboardData({ deploymentId: requested, scope, githubRepositoryId: repo, historyOffset: offset });
+  const selected = data?.selected ?? null;
+
+  // Recalled memory: only on explicit request, only for a deployment the viewer can see.
+  let memory: RecalledMemoryData | null = null;
+  if (params.memory === "1" && selected) {
+    const raw = await getDeploymentById(selected.deployment.id);
+    if (raw) memory = await recallForDeployment(raw, user ? `user:${user.user.id}` : "internal");
+  }
+
+  const currentRepository =
+    user && selected ? user.repositories.find((r) => String(r.github_repository_id) === selected.deployment.github_repository_id) ?? null : null;
+  const allDisconnected = user ? user.repositories.length > 0 && user.repositories.every((r) => r.connection_state !== "CONNECTED") : false;
 
   // Keep the page current while CI or risk analysis is still in progress.
   const inProgress =
@@ -62,16 +102,15 @@ export default async function Dashboard({
 
   return (
     <>
+      <a className="skip-link" href="#main">Skip to content</a>
       <header className="topbar">
         <div className="topbar-inner">
-          <a href="/" className="brand" style={{ textDecoration: "none" }}>
-            DeployGuard
-          </a>
-          <nav className="nav">
-            <a href="#overview">Overview</a>
-            <a href="#deployments">Deployments</a>
-            <a href="#incidents">Incidents</a>
-            {user ? <a href="#repositories">Repositories</a> : null}
+          <a href="/" className="brand">DeployGuard</a>
+          <nav className="nav" aria-label="Sections">
+            <a href={`${links.home()}#overview`}>Overview</a>
+            <a href={`${links.home()}#deployments`}>Deployments</a>
+            <a href={`${links.home()}#incidents`}>Incidents</a>
+            {user ? <a href={`${links.home()}#repositories`}>Connections</a> : null}
           </nav>
           <span className="topbar-meta">
             {inProgress ? "Updating automatically · " : ""}Loaded {absoluteTime(new Date())}
@@ -89,61 +128,100 @@ export default async function Dashboard({
           ) : null}
         </div>
       </header>
-      {inProgress ? <AutoRefresh /> : null}
+      {inProgress && !incidentId ? <AutoRefresh /> : null}
 
-      <main className="page">
-        {connect ? <div className="note">{connect}</div> : null}
+      <main className="page" id="main">
+        {connect ? <div className="note" role="status">{connect}</div> : null}
 
-        {data.notFound ? (
-          <section className="panel">
-            <div className="empty">
-              <strong>Deployment #{requested} not found.</strong>
-              <a href="/">Show the latest deployment</a>
-            </div>
-          </section>
+        {hasRepositories ? (
+          <div className="context-bar">
+            <RepositorySwitcher options={options} current={repo} />
+            <span className="muted small">
+              {repoName ? <>Showing <strong>{repoName}</strong>. </> : "Showing all your repositories. "}
+              {requestedRepo && !repo ? "The requested repository is not one of yours, so it is not shown." : null}
+            </span>
+          </div>
         ) : null}
 
         {!hasRepositories ? (
-          <section className="panel" id="overview">
-            <div className="empty">
-              <strong>No repositories connected.</strong>
-              <p style={{ margin: "2px 0 12px" }}>Connect a GitHub repository to begin monitoring deployments.</p>
+          <section className="panel" id="overview" aria-labelledby="welcome-title">
+            <div className="panel-body">
+              <h2 id="welcome-title">Welcome to DeployGuard</h2>
+              <p>DeployGuard watches the repositories you choose, remembers what happened to past deployments, and warns you with reasons when a new change looks risky. It is advisory: it never blocks or changes anything.</p>
+              <ol className="checks">
+                <li>Connect one or more GitHub repositories (read-only access you choose on GitHub).</li>
+                <li>Push a change. DeployGuard records it, analyses which files changed, and follows its GitHub Actions run.</li>
+                <li>Open the dashboard to see the risk, the evidence behind it, and the outcome.</li>
+              </ol>
               <a className="button button-primary" href="/auth/github/install">
                 Connect GitHub repositories
               </a>
             </div>
           </section>
+        ) : incidentId ? (
+          incident ? (
+            <IncidentDetail data={incident} links={links} />
+          ) : (
+            <section className="panel">
+              <div className="empty">
+                <strong>Incident #{incidentId} not found.</strong>
+                <a href={links.home()}>Back to the dashboard</a>
+              </div>
+            </section>
+          )
+        ) : data?.notFound ? (
+          <section className="panel">
+            <div className="empty">
+              <strong>Deployment #{requested} not found.</strong>
+              <a href={links.home()}>Show the latest deployment</a>
+            </div>
+          </section>
         ) : selected ? (
           <>
-            <CurrentDeployment d={selected.deployment} isLatest={!requested || selected.deployment.id === data.history[0]?.id} />
+            <CurrentDeployment
+              d={selected.deployment}
+              isLatest={!requested || selected.deployment.id === data?.history[0]?.id}
+              links={links}
+              repository={currentRepository}
+            />
             <div className="grid">
               <div className="stack">
-                <RiskPanel risk={selected.risk} />
+                <RiskPanel
+                  risk={selected.risk}
+                  reanalyze={selected.reanalyze}
+                  deploymentId={selected.deployment.id}
+                  links={links}
+                  canAct={Boolean(user)}
+                  memoryHref={memory ? null : links.memory(selected.deployment.id)}
+                />
+                {memory ? <RecalledMemory data={memory} links={links} closeHref={links.deployment(selected.deployment.id)} /> : null}
                 <ChangeAnalysis d={selected.deployment} />
               </div>
               <div className="stack">
-                <PipelinePanel d={selected.deployment} incident={selected.incident} />
-                {user ? <ConnectedRepositories repositories={user.repositories} /> : null}
+                <PipelinePanel d={selected.deployment} incident={selected.incident} links={links} />
+                {user ? <ConnectedRepositories repositories={user.repositories} links={links} /> : null}
               </div>
             </div>
-            <HistoricalEvidence evidence={selected.evidence} />
+            <HistoricalEvidence evidence={selected.evidence} links={links} />
           </>
-        ) : !data.notFound ? (
+        ) : (
           <>
             <section className="panel" id="overview">
               <div className="empty">
-                <strong>No deployments yet.</strong>
-                Push a change to your connected repository to begin monitoring.
+                <strong>{repoName ? `No deployments recorded for ${repoName} yet.` : "No deployments yet."}</strong>
+                {allDisconnected
+                  ? "None of your repositories is currently monitored. Reconnect one on GitHub to record new pushes."
+                  : "Push a change to a connected repository. It appears here within seconds of GitHub delivering the push."}
               </div>
             </section>
-            {user ? <ConnectedRepositories repositories={user.repositories} /> : null}
+            {user ? <ConnectedRepositories repositories={user.repositories} links={links} /> : null}
           </>
-        ) : null}
+        )}
 
-        {data.history.length ? (
-          <DeploymentHistory rows={data.history} selectedId={selected?.deployment.id ?? null} />
+        {data && data.history.length ? (
+          <DeploymentHistory rows={data.history} selectedId={selected?.deployment.id ?? null} counts={data.counts} page={data.page} links={links} />
         ) : null}
-        {data.history.length ? <IncidentHistory rows={data.incidents} /> : null}
+        {data && data.history.length ? <IncidentHistory rows={data.incidents} links={links} /> : null}
       </main>
     </>
   );
