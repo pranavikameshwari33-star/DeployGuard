@@ -1,8 +1,9 @@
 import { analyzeChanges } from "@/lib/analysis/change-analysis";
 import { insertDeployment, type Deployment } from "@/lib/db/deployments";
 import type { PushEvent } from "@/lib/github/parse-push-event";
-import { retain } from "@/lib/hindsight/client";
-import { buildDeploymentMemory } from "@/lib/hindsight/deployment-memory";
+import { enqueue } from "@/lib/jobs/queue";
+import { JOB_TYPES } from "@/lib/jobs/types";
+import { kickQueue } from "@/lib/jobs/runner";
 import { scheduleRiskAnalysis } from "@/lib/risk/auto-risk";
 import { redact } from "@/lib/security/redact";
 
@@ -42,7 +43,7 @@ export function redactPushEvent(event: PushEvent): PushEvent {
 export type IngestResult = {
   deployment: Deployment;
   isNew: boolean;
-  memory?: { stored: boolean; error?: string };
+  memory?: { queued: boolean; jobId?: string };
   riskScheduled: boolean;
 };
 
@@ -82,22 +83,26 @@ export async function ingestPush(
   }
   console.log(`[DeployGuard][db] Stored deployment #${deployment.id} with status ${deployment.status} (${options.source}).`);
 
-  // Agent memory (best effort).
-  let memory: { stored: boolean; error?: string };
+  // Agent memory (Stage 2: a queued job with retries, never inside the request).
+  let memory: { queued: boolean; jobId?: string };
   try {
-    await retain(buildDeploymentMemory(deployment));
-    memory = { stored: true };
-    console.log(`[DeployGuard][memory] Stored deployment #${deployment.id} in Hindsight.`);
+    const job = await enqueue(
+      JOB_TYPES.deploymentMemory,
+      { deploymentId: deployment.id },
+      { dedupeKey: `memory.deployment:${deployment.id}:RECEIVED`, maxAttempts: 6 }
+    );
+    memory = { queued: true, jobId: job.id };
   } catch (error) {
-    memory = { stored: false, error: (error as Error).message };
+    memory = { queued: false };
     console.error(
-      `[DeployGuard][memory] Hindsight write FAILED for deployment #${deployment.id}: ${memory.error}\n` +
+      `[DeployGuard][memory] Could not queue the memory for deployment #${deployment.id}: ${(error as Error).message}\n` +
         `             The deployment IS safely stored in the database. Re-store it later with the internal /api/memory/backfill endpoint.`
     );
   }
 
-  // Automatic risk analysis (Phase 8): marked pending now, runs after the response.
+  // Automatic risk analysis (Phase 8): marked pending now, queued as a job.
   const riskScheduled = options.autoRisk ? await scheduleRiskAnalysis(deployment.id, options.source) : false;
+  kickQueue();
 
   return { deployment, isNew, memory, riskScheduled };
 }

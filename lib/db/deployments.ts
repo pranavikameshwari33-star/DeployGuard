@@ -55,6 +55,8 @@ export type Deployment = {
   github_repository_id: string | null;
   /** Stage 1: what kind of content was redacted from this record (counts/categories, never values). */
   redaction: DeploymentRedaction | null;
+  /** Stage 2: GitHub time of the newest pipeline event applied (ordering guard). */
+  ci_last_event_at: Date | null;
 };
 
 export type RedactionCount = { count: number; categories: string[] };
@@ -74,7 +76,7 @@ const COLUMNS = `
   updated_at, ci_run_id, ci_run_url, ci_started_at, ci_finished_at,
   failure_stage, failure_job, failure_message, file_analysis, change_categories,
   affected_services, risk_analysis_status, risk_analysis_error, risk_analysis_updated_at,
-  repository_id, github_repository_id, redaction
+  repository_id, github_repository_id, redaction, ci_last_event_at
 `;
 
 /**
@@ -108,7 +110,8 @@ export async function insertDeployment(
        repository_id, github_repository_id, redaction
      )
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'RECEIVED', $11::jsonb, $12, $13, $14, $15, $16::jsonb)
-     ON CONFLICT (owner, repository, branch, commit_sha) DO NOTHING
+     -- Either unique key (name-based, or Stage 2 repository-id-based) means "already recorded".
+     ON CONFLICT DO NOTHING
      RETURNING ${COLUMNS}`,
     [
       event.repository,
@@ -141,7 +144,8 @@ export async function insertDeployment(
     `UPDATE deployments SET
        repository_id        = COALESCE(repository_id, $5),
        github_repository_id = COALESCE(github_repository_id, $6)
-     WHERE owner = $1 AND repository = $2 AND branch = $3 AND commit_sha = $4
+     WHERE (owner = $1 AND repository = $2 AND branch = $3 AND commit_sha = $4)
+        OR (github_repository_id = $6 AND branch = $3 AND commit_sha = $4)
      RETURNING ${COLUMNS}`,
     [event.owner, event.repository, event.branch, event.commitSha, repositoryId, event.githubRepositoryId]
   );
@@ -186,6 +190,25 @@ export async function startRiskAnalysis(deploymentId: string): Promise<string> {
 }
 
 /**
+ * Stage 2: the in-flight lock for a user's Re-analyze. Atomically starts an
+ * attempt ONLY if no other attempt started within `lockSeconds`; returns null
+ * when one is already running, so two clicks never make two Gemini calls.
+ */
+export async function tryStartRiskAnalysis(deploymentId: string, lockSeconds = 180): Promise<string | null> {
+  const attempt = crypto.randomUUID();
+  const result = await getPool().query(
+    `UPDATE deployments
+     SET risk_analysis_status = 'pending', risk_analysis_error = NULL,
+         risk_analysis_updated_at = now(), risk_analysis_attempt = $2
+     WHERE id = $1
+       -- COALESCE: a never-analysed row has NULL status, and NOT (NULL ...) would be NULL (= refuse).
+       AND NOT COALESCE(risk_analysis_status = 'pending' AND risk_analysis_updated_at > now() - make_interval(secs => $3), false)`,
+    [deploymentId, attempt, lockSeconds]
+  );
+  return (result.rowCount ?? 0) > 0 ? attempt : null;
+}
+
+/**
  * Records how an attempt ended -- unless a newer attempt has started since, in
  * which case this (older) outcome is dropped and the newer one will report.
  */
@@ -211,6 +234,11 @@ export async function listStuckRiskAnalyses(olderThanMinutes: number, limit: num
   const result = await getPool().query<{ id: string }>(
     `SELECT id FROM deployments
      WHERE risk_analysis_status = 'pending' AND risk_analysis_updated_at < now() - make_interval(mins => $1)
+       -- Stage 2: a job still queued/running (e.g. waiting for a retry) is not stuck.
+       AND NOT EXISTS (
+         SELECT 1 FROM jobs j
+         WHERE j.type = 'risk.analyze' AND j.payload->>'deploymentId' = deployments.id::text
+           AND j.status IN ('queued', 'running'))
      ORDER BY risk_analysis_updated_at LIMIT $2`,
     [olderThanMinutes, limit]
   );
@@ -354,12 +382,20 @@ export type StatusUpdate = {
   failure?: { stage?: string; job?: string; message?: string };
   /** Stage 1: set by the lifecycle when the failure output had something masked. */
   failureRedaction?: RedactionCount;
+  /**
+   * Stage 2: when GitHub says this state happened (workflow_run updated_at).
+   * An event OLDER than the newest one already applied is ignored, so a late
+   * "in progress" can never overwrite SUCCESS/FAILED. Reports without a time
+   * (the CI reporter) count as "now".
+   */
+  eventAt?: string;
 };
 
 export type UpdateResult =
   | { outcome: "updated"; deployment: Deployment; previousStatus: DeploymentStatus }
   | { outcome: "not_found" }
-  | { outcome: "invalid_transition"; currentStatus: DeploymentStatus };
+  | { outcome: "invalid_transition"; currentStatus: DeploymentStatus }
+  | { outcome: "stale_event"; currentStatus: DeploymentStatus };
 
 /**
  * Moves an EXISTING deployment to a new pipeline status. Never inserts: the row
@@ -395,9 +431,14 @@ export async function updateDeploymentStatus(
        failure_job     = $10,
        failure_message = $11,
        redaction       = CASE WHEN $12::jsonb IS NULL THEN d.redaction
-                              ELSE COALESCE(d.redaction, '{}'::jsonb) || $12::jsonb END
+                              ELSE COALESCE(d.redaction, '{}'::jsonb) || $12::jsonb END,
+       ci_last_event_at = GREATEST(d.ci_last_event_at, COALESCE($13::timestamptz, now()))
      FROM prev
      WHERE d.id = prev.id AND prev.status = ANY($6::text[])
+       -- Stage 2 ordering: only newer events (a repeat of the same state at the same time is harmless).
+       AND (d.ci_last_event_at IS NULL
+            OR COALESCE($13::timestamptz, now()) > d.ci_last_event_at
+            OR (COALESCE($13::timestamptz, now()) = d.ci_last_event_at AND prev.status = $5::text))
      RETURNING d.*, prev.status AS previous_status`,
     [
       key.owner,
@@ -412,6 +453,7 @@ export async function updateDeploymentStatus(
       isFailed ? update.failure?.job ?? null : null,
       isFailed ? update.failure?.message ?? null : null,
       isFailed && update.failureRedaction?.count ? JSON.stringify({ failure_output: update.failureRedaction }) : null,
+      update.eventAt ?? null,
     ]
   );
 
@@ -428,7 +470,10 @@ export async function updateDeploymentStatus(
     [key.owner, key.repository, key.branch, key.commitSha]
   );
 
-  return existing.rows.length === 0
-    ? { outcome: "not_found" }
-    : { outcome: "invalid_transition", currentStatus: existing.rows[0].status };
+  if (existing.rows.length === 0) return { outcome: "not_found" };
+  const currentStatus = existing.rows[0].status;
+  // Allowed move, but refused by the ordering check: an out-of-date event.
+  return ALLOWED_FROM[update.status].includes(currentStatus)
+    ? { outcome: "stale_event", currentStatus }
+    : { outcome: "invalid_transition", currentStatus };
 }

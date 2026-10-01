@@ -1,9 +1,8 @@
-import { NextResponse, after } from "next/server";
+import { NextResponse } from "next/server";
 import { verifyGithubSignature } from "@/lib/github/verify-signature";
 import {
   handleInstallationEvent,
   handleInstallationRepositoriesEvent,
-  processWorkflowRun,
   resolveRepositoryForEvent,
 } from "@/lib/github/app-events";
 import { branchFromRef, parsePushEvent, type PushEvent } from "@/lib/github/parse-push-event";
@@ -12,6 +11,10 @@ import { ingestPush } from "@/lib/pipeline/ingest-push";
 import { beginDelivery, finishDelivery, type DeliveryStatus } from "@/lib/db/webhook-deliveries";
 import { rateLimitResponse } from "@/lib/auth/rate-limit";
 import { redactPushEvent } from "@/lib/pipeline/ingest-push";
+import { enqueue } from "@/lib/jobs/queue";
+import { JOB_TYPES } from "@/lib/jobs/types";
+import { kickQueue } from "@/lib/jobs/runner";
+import { logErrorRef } from "@/lib/auth/session";
 
 // node:crypto is not available on the Edge runtime, so pin this to Node.
 export const runtime = "nodejs";
@@ -21,8 +24,13 @@ export const dynamic = "force-dynamic";
 /**
  * POST /api/webhook/github
  *
- * GitHub push  ->  verify  ->  change analysis  ->  PostgreSQL (source of truth)  ->  Hindsight (agent memory)
- *              ->  (after the response) automatic risk analysis
+ * GitHub push  ->  verify  ->  change analysis  ->  PostgreSQL (source of truth)
+ *              ->  queued jobs: Hindsight memory, automatic risk analysis (Stage 2)
+ *
+ * Stage 2: the request does only the fast, durable part (signature, delivery
+ * log, one INSERT) and answers. Everything slow -- Hindsight, Gemini, GitHub
+ * API calls -- runs as jobs in the PostgreSQL queue (lib/jobs), with retries,
+ * backoff and a dead-letter state.
  *
  * Phase 9: the same endpoint also receives the GitHub App's events, after the
  * same signature check: installation, installation_repositories (which
@@ -153,21 +161,19 @@ export async function POST(request: Request) {
   }
 
   if (eventType === "workflow_run") {
-    // Needs GitHub API calls (all runs for the commit, failed job, log tail) and
-    // may wait for the push webhook, so it runs after the response. Its payload
-    // is in the delivery log; if this callback is lost, maintenance retries it.
-    after(async () => {
-      try {
-        const result = await processWorkflowRun(payload as Parameters<typeof processWorkflowRun>[0]);
-        console.log(`[DeployGuard][actions] workflow_run (delivery ${deliveryId}): ${result}`);
-        finish(result.startsWith("ignored") ? "ignored" : "processed");
-      } catch (error) {
-        const message = (error as Error).message;
-        console.error(`[DeployGuard][actions] workflow_run (delivery ${deliveryId}) failed: ${message}`);
-        finish("failed", message);
-      }
-    });
-    return NextResponse.json({ ok: true, event: eventType, accepted: true }, { status: 202 });
+    // Stage 2: needs GitHub API calls (all runs for the commit, failed job, log
+    // tail) and may have to wait for the push, so it becomes a queued job. The
+    // payload is in the delivery log; the job is keyed by the delivery GUID, so
+    // a redelivery never queues it twice. Retries/backoff/dead-letter come from the queue.
+    try {
+      if (!tracked) throw new Error("delivery log unavailable");
+      await enqueue(JOB_TYPES.workflowRun, { deliveryId }, { dedupeKey: `webhook:${deliveryId}`, maxAttempts: 8 });
+    } catch (error) {
+      const errorRef = logErrorRef(`Could not queue workflow_run ${deliveryId}: ${(error as Error).message}`, "jobs");
+      return NextResponse.json({ ok: false, stage: "queue", error: "Could not queue the event.", errorRef }, { status: 500 });
+    }
+    kickQueue();
+    return NextResponse.json({ ok: true, event: eventType, accepted: true, queued: true }, { status: 202 });
   }
 
   if (eventType !== "push") {
@@ -244,7 +250,7 @@ export async function POST(request: Request) {
 
   return NextResponse.json({
     ok: true,
-    stage: memory?.stored ? "memory" : "database",
+    stage: "database",
     riskAnalysis: autoRisk ? (ingested.riskScheduled ? "scheduled" : "not scheduled") : "skipped",
     duplicate: false,
     deploymentId: deployment.id,
@@ -257,9 +263,8 @@ export async function POST(request: Request) {
       changeCategories: deployment.change_categories,
       affectedServices: deployment.affected_services,
     },
-    memory: memory?.stored
-      ? { stored: true }
-      : { stored: false, note: "Deployment record is stored in the database; the memory write is logged server-side." },
+    // Stage 2: the Hindsight write is a queued job (retried with backoff).
+    memory: memory?.queued ? { queued: true, jobId: memory.jobId } : { queued: false, note: "Deployment record is stored in the database; the memory job could not be queued (logged)." },
   });
 }
 

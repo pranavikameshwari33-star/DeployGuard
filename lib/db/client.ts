@@ -37,6 +37,27 @@ export function getPool(): Pool {
   return globalForDb.__deployguardPool;
 }
 
+/**
+ * Stage 2: runs `fn` again (up to `attempts` times, 1 s then 2 s apart) when it
+ * failed because a CONNECTION could not be made or was dropped -- e.g. a
+ * hosted pooler that is briefly slow to accept a connection. Query errors
+ * (constraint violations, syntax) are never retried. `fn` must be safe to run
+ * again (a whole transaction, or an idempotent statement).
+ */
+export async function withConnectionRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      const message = (error as Error).message ?? "";
+      const transient = /Connection terminated|connection timeout|timeout exceeded when trying to connect|ECONNRESET|ECONNREFUSED|ETIMEDOUT/i.test(message);
+      if (!transient || attempt >= attempts) throw error;
+      console.warn(`[DeployGuard][db] Connection problem (${message}); retrying (${attempt}/${attempts - 1}).`);
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
+    }
+  }
+}
+
 function isLocalConnection(connectionString: string): boolean {
   try {
     const host = new URL(connectionString).hostname;

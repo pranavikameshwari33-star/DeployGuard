@@ -6,9 +6,9 @@ import {
   type StatusUpdate,
 } from "@/lib/db/deployments";
 import { recordIncident, type IncidentResult } from "@/lib/db/incidents";
-import { retain } from "@/lib/hindsight/client";
-import { buildDeploymentMemory } from "@/lib/hindsight/deployment-memory";
-import { buildIncidentMemory } from "@/lib/hindsight/incident-memory";
+import { enqueue } from "@/lib/jobs/queue";
+import { JOB_TYPES } from "@/lib/jobs/types";
+import { kickQueue } from "@/lib/jobs/runner";
 import { scheduleRiskAnalysis } from "@/lib/risk/auto-risk";
 import { mergeSummaries, prepareFailureOutput, redact } from "@/lib/security/redact";
 
@@ -25,6 +25,7 @@ import { mergeSummaries, prepareFailureOutput, redact } from "@/lib/security/red
 export type ApplyStatusResult =
   | { outcome: "not_found" }
   | { outcome: "invalid_transition"; currentStatus: DeploymentStatus }
+  | { outcome: "stale_event"; currentStatus: DeploymentStatus }
   | { outcome: "incident_error"; deployment: Deployment; message: string }
   | {
       outcome: "updated";
@@ -36,7 +37,8 @@ export type ApplyStatusResult =
       riskRefreshScheduled: boolean;
     };
 
-type MemoryWrite = { stored: boolean; error?: string };
+/** Stage 2: memory writes are queued jobs; the result says whether the job was queued. */
+type MemoryWrite = { queued: boolean; jobId?: string };
 
 export async function applyPipelineStatus(
   key: DeploymentKey,
@@ -61,6 +63,10 @@ export async function applyPipelineStatus(
 
   if (result.outcome === "not_found") {
     console.warn(`[DeployGuard][${source}] No deployment for ${label} (status ${update.status} not applied).`);
+    return result;
+  }
+  if (result.outcome === "stale_event") {
+    console.log(`[DeployGuard][${source}] Ignored out-of-date ${update.status} event for ${label} (current: ${result.currentStatus}).`);
     return result;
   }
   if (result.outcome === "invalid_transition") {
@@ -91,43 +97,22 @@ export async function applyPipelineStatus(
     }
   }
 
-  // ---------- agent memory (best effort, final results only) ----------
+  // ---------- agent memory (Stage 2: queued, final results only) ----------
   // BUILDING is a passing moment and is not worth remembering. The final result
-  // REPLACES the memory the webhook wrote (same document_id). A FAILED
-  // deployment also gets its incident memory; both writes run in parallel.
+  // REPLACES the memory the webhook wrote (same document_id). The Hindsight
+  // writes run as queued jobs (retried with backoff), never inside this request.
   let memory: MemoryWrite | { skipped: string } = {
     skipped: "Only final results (SUCCESS / FAILED) are written to Hindsight.",
   };
   let incidentMemory: MemoryWrite | undefined;
 
   if (deployment.status === "SUCCESS" || deployment.status === "FAILED") {
-    const [deploymentWrite, incidentWrite] = await Promise.allSettled([
-      retain(buildDeploymentMemory(deployment)),
-      incident ? retain(buildIncidentMemory(incident.incident, deployment)) : Promise.resolve(undefined),
-    ]);
-
-    memory = settled(deploymentWrite);
-    if (memory.stored) {
-      console.log(`[DeployGuard][memory] Updated deployment #${deployment.id} in Hindsight (${deployment.status}).`);
-    } else {
-      console.error(
-        `[DeployGuard][memory] Hindsight write FAILED for deployment #${deployment.id}: ${memory.error}\n` +
-          `             The ${deployment.status} status IS saved in the database. Re-store it later with: curl -X POST http://localhost:3000/api/memory/backfill`
-      );
-    }
-
+    const version = `${deployment.status}:${deployment.ci_last_event_at?.getTime() ?? deployment.updated_at.getTime()}`;
+    memory = await queueMemory(JOB_TYPES.deploymentMemory, deployment.id, `memory.deployment:${deployment.id}:${version}`);
     if (incident) {
-      incidentMemory = settled(incidentWrite);
-      const id = incident.incident.id;
-      if (incidentMemory.stored) {
-        console.log(`[DeployGuard][memory] Stored incident #${id} in Hindsight.`);
-      } else {
-        console.error(
-          `[DeployGuard][memory] Hindsight write FAILED for incident #${id}: ${incidentMemory.error}\n` +
-            `             The incident IS saved in the database. Re-send the FAILED report to store it again.`
-        );
-      }
+      incidentMemory = await queueMemory(JOB_TYPES.incidentMemory, deployment.id, `memory.incident:${deployment.id}:${version}`);
     }
+    kickQueue();
   }
 
   // ---------- refresh the risk analysis with the CI result (Phase 8) ----------
@@ -162,8 +147,12 @@ export function redactStatusUpdate(update: StatusUpdate): StatusUpdate {
   };
 }
 
-function settled(result: PromiseSettledResult<unknown>): MemoryWrite {
-  return result.status === "fulfilled"
-    ? { stored: true }
-    : { stored: false, error: (result.reason as Error).message };
+async function queueMemory(type: string, deploymentId: string, dedupeKey: string): Promise<MemoryWrite> {
+  try {
+    const job = await enqueue(type, { deploymentId }, { dedupeKey, maxAttempts: 6 });
+    return { queued: true, jobId: job.id };
+  } catch (error) {
+    console.error(`[DeployGuard][memory] Could not queue ${type} for deployment #${deploymentId}: ${(error as Error).message}`);
+    return { queued: false };
+  }
 }

@@ -1,13 +1,14 @@
-import { after } from "next/server";
 import { finishRiskAnalysis, startRiskAnalysis } from "@/lib/db/deployments";
+import { enqueue } from "@/lib/jobs/queue";
+import { kickQueue } from "@/lib/jobs/runner";
+import { JOB_TYPES } from "@/lib/jobs/types";
 import { analyzeDeploymentRisk } from "@/lib/risk/analyze-risk";
 
 /**
- * Phase 8: run the Phase 7 risk analysis automatically, AFTER the response.
+ * Phase 8: run the Phase 7 risk analysis automatically, outside the request.
  *
  * Called from the push webhook (new deployment) and from the CI lifecycle
- * (final SUCCESS / FAILED). Next.js's `after()` runs the callback once the
- * response has been sent, so GitHub and the pipeline never wait for Gemini.
+ * (final SUCCESS / FAILED). GitHub and the pipeline never wait for Gemini.
  *
  * Nothing new is decided here -- it reuses analyzeDeploymentRisk unchanged:
  *   - the same facts (evidence fingerprint) reuse the stored assessment, so a
@@ -17,44 +18,64 @@ import { analyzeDeploymentRisk } from "@/lib/risk/analyze-risk";
  *   - a Gemini failure or rejected answer stores NO assessment. The deployment
  *     is untouched and only risk_analysis_status becomes "unavailable".
  *
- * Phase 10: the deployment is marked "pending" BEFORE the response is sent.
- * If the after() callback is lost (serverless timeout, crash, restart), the
- * row stays "pending" and the maintenance run picks it up again
- * (resumeStuckRiskAnalyses) instead of the analysis silently never happening.
+ * Stage 2: the deployment is marked "pending" and a `risk.analyze` job is
+ * queued BEFORE the response is sent (one job per attempt, deduplicated).
+ * Transient Gemini failures (overload, timeout, rate limit) are retried by the
+ * queue with exponential backoff, a bounded number of times; anything else
+ * ends as "unavailable" at once.
  */
 export async function scheduleRiskAnalysis(deploymentId: string, trigger: string): Promise<boolean> {
-  let attempt: string;
   try {
-    attempt = await startRiskAnalysis(deploymentId);
+    const attempt = await startRiskAnalysis(deploymentId);
+    await enqueue(JOB_TYPES.riskAnalyze, { deploymentId, attempt, trigger }, { dedupeKey: `risk:${deploymentId}:${attempt}`, maxAttempts: 3 });
   } catch (error) {
-    console.error(`[DeployGuard][risk] Could not start automatic analysis for #${deploymentId}: ${(error as Error).message}`);
+    console.error(`[DeployGuard][risk] Could not schedule automatic analysis for #${deploymentId}: ${(error as Error).message}`);
     return false;
   }
-  after(() => runRiskAnalysis(deploymentId, attempt, trigger));
+  kickQueue();
   return true;
 }
 
+const TRANSIENT = new Set(["unavailable", "timeout", "rate_limit"]);
+
+export type RiskRunOutcome = { summary: string; retryable: boolean; kind?: string };
+
 /** Runs one analysis attempt and records its outcome (only if it is still the newest attempt). */
-export async function runRiskAnalysis(deploymentId: string, attempt: string, trigger: string): Promise<void> {
+export async function runRiskAnalysis(
+  deploymentId: string,
+  attempt: string,
+  trigger: string,
+  /** false while the queue will retry a transient failure: the row then stays "pending". */
+  finalAttempt = true
+): Promise<RiskRunOutcome> {
   let outcome: { status: "completed" } | { status: "unavailable"; error: string };
+  let result: RiskRunOutcome;
   try {
-    const result = await analyzeDeploymentRisk(deploymentId);
-    if (result.status === "assessed") {
+    const analysis = await analyzeDeploymentRisk(deploymentId);
+    if (analysis.status === "assessed") {
       outcome = { status: "completed" };
-      console.log(
-        `[DeployGuard][risk] Automatic analysis (${trigger}) for #${deploymentId}: ` +
-          `${result.assessment.risk_level} (${result.source === "stored" ? "reused stored assessment" : "new Gemini assessment"}).`
-      );
-    } else if (result.status === "unavailable") {
-      const detail = result.errors?.length ? ` ${result.errors.slice(0, 3).join("; ")}` : "";
-      outcome = { status: "unavailable", error: `${result.message}${detail}` };
+      result = {
+        summary: `${analysis.assessment.risk_level} (${analysis.source === "stored" ? "reused stored assessment" : "new Gemini assessment"})`,
+        retryable: false,
+      };
+      console.log(`[DeployGuard][risk] Automatic analysis (${trigger}) for #${deploymentId}: ${result.summary}.`);
+    } else if (analysis.status === "unavailable") {
+      const detail = analysis.errors?.length ? ` ${analysis.errors.slice(0, 3).join("; ")}` : "";
+      outcome = { status: "unavailable", error: `${analysis.message}${detail}` };
+      result = { summary: `unavailable (${analysis.reason})`, retryable: TRANSIENT.has(analysis.kind ?? ""), kind: analysis.kind ?? analysis.reason };
     } else {
       outcome = { status: "unavailable", error: "Deployment not found when the analysis ran." };
+      result = { summary: "deployment not found", retryable: false };
     }
   } catch (error) {
     outcome = { status: "unavailable", error: `Risk analysis failed: ${(error as Error).message}` };
+    result = { summary: "failed", retryable: true, kind: "error" };
   }
 
+  if (outcome.status === "unavailable" && result.retryable && !finalAttempt) {
+    console.warn(`[DeployGuard][risk] Automatic analysis (${trigger}) for #${deploymentId} temporarily unavailable; will retry: ${outcome.error}`);
+    return result;
+  }
   if (outcome.status === "unavailable") {
     console.warn(`[DeployGuard][risk] Automatic analysis (${trigger}) for #${deploymentId} unavailable: ${outcome.error}`);
   }
@@ -63,4 +84,5 @@ export async function runRiskAnalysis(deploymentId: string, attempt: string, tri
   } catch (error) {
     console.error(`[DeployGuard][risk] Could not record analysis outcome for #${deploymentId}: ${(error as Error).message}`);
   }
+  return result;
 }

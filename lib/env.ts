@@ -57,7 +57,24 @@ export const env = {
   githubAppClientSecret: () => required("GITHUB_APP_CLIENT_SECRET"),
   /** Accepts a multi-line PEM or a single line with escaped "\n" sequences. */
   githubAppPrivateKey: () => required("GITHUB_APP_PRIVATE_KEY").replace(/\\n/g, "\n"),
+
+  // --- Stage 2: usage caps and data retention (optional, with defaults) ---
+  /** Gemini calls per repository per day / per calendar month. */
+  geminiDailyCap: () => intOption("DEPLOYGUARD_GEMINI_DAILY_CAP", 50),
+  geminiMonthlyCap: () => intOption("DEPLOYGUARD_GEMINI_MONTHLY_CAP", 500),
+  /** Days to keep observed failure output (log tails); 0 = keep forever. */
+  retentionFailureOutputDays: () => intOption("DEPLOYGUARD_RETENTION_FAILURE_OUTPUT_DAYS", 90),
+  /** Days to keep deployments at all (with incidents, assessments, memories); 0 = keep forever. */
+  retentionDeploymentDays: () => intOption("DEPLOYGUARD_RETENTION_DEPLOYMENT_DAYS", 0),
 };
+
+function intOption(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) throw new Error(`${name} must be a whole number >= 0.`);
+  return n;
+}
 
 /** Every variable whose value is a secret. Used by the tripwire below and by startup validation. */
 export const SECRET_ENV_NAMES = [

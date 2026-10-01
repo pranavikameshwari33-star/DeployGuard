@@ -22,6 +22,7 @@
  */
 import pg from "pg";
 import { loadEnv } from "./load-env.mjs";
+import { waitForJob } from "./job-helpers.mjs";
 import { internalFetch } from "./internal-fetch.mjs";
 import { buildPushPayload, deliver } from "./test-payload.mjs";
 
@@ -230,10 +231,12 @@ try {
       "root cause, resolution, downstream effect and affected service are NULL (unknown)"
     );
 
+    // Stage 2: the incident memory is a queued job (not written inside the CI request).
+    const incidentJob = await waitForJob(client, r.body.incident?.memory?.jobId);
     check(
-      r.body.incident?.memory?.stored === true,
-      "incident memory written to Hindsight",
-      r.body.incident?.memory?.stored ? "" : r.body.incident?.memory?.error ?? "unknown reason"
+      r.body.incident?.memory?.queued === true && incidentJob?.status === "succeeded",
+      "incident memory written to Hindsight (queued job succeeded)",
+      `queued=${r.body.incident?.memory?.queued}, job=${incidentJob?.status ?? "timeout"} ${incidentJob?.last_error ?? ""}`
     );
     created.push({ ...t, payload, incident });
   }

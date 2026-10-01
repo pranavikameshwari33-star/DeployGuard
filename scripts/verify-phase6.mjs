@@ -25,6 +25,7 @@ import crypto from "node:crypto";
 import { loadEnv } from "./load-env.mjs";
 import { internalFetch } from "./internal-fetch.mjs";
 import { buildPushPayload, deliver } from "./test-payload.mjs";
+import { runQueue } from "./job-helpers.mjs";
 
 loadEnv();
 
@@ -130,6 +131,12 @@ try {
   await report(docs, "BUILDING");
   await report(docs, "SUCCESS");
   pass("history created", `#${dbFailure.id} FAILED db, #${paymentSuccess.id} SUCCESS payment, #${dbTests.id} SUCCESS db tests, #${docs.id} SUCCESS docs`);
+
+  // Stage 2: memory writes are queued jobs. Drain the queue so every memory of
+  // this history is in Hindsight before similarity is asked (same precondition
+  // the synchronous writes used to guarantee).
+  const drained = await runQueue(BASE, internalFetch);
+  if (!drained.ok) fail("queue drained before similarity", JSON.stringify(drained).slice(0, 120));
 
   // --- current deployments (RECEIVED, not yet built) -------------------------
   const currentDb = await push("increase database pool timeout", {

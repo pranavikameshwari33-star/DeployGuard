@@ -352,13 +352,22 @@ export type UserRepository = {
   /** Connected to an active installation: DeployGuard is receiving its events. */
   monitoring: boolean;
   installation_status: InstallationStatus;
+  /**
+   * Stage 2: one explicit state. SUSPENDED = the installation is suspended on
+   * GitHub (resumable); DISCONNECTED = removed from the installation or the App
+   * was uninstalled. History is kept in both cases.
+   */
+  connection_state: "CONNECTED" | "DISCONNECTED" | "SUSPENDED";
 };
 
 /** Every repository the user owns through their installations, monitored or not (history stays theirs). */
 export async function listUserRepositories(userId: string): Promise<UserRepository[]> {
   const result = await getPool().query<UserRepository>(
     `SELECT r.id, r.github_repository_id, r.full_name, r.private, r.default_branch,
-            (r.connected AND i.status = 'active') AS monitoring, i.status AS installation_status
+            (r.connected AND i.status = 'active') AS monitoring, i.status AS installation_status,
+            CASE WHEN i.status = 'suspended' AND r.connected THEN 'SUSPENDED'
+                 WHEN r.connected AND i.status = 'active' THEN 'CONNECTED'
+                 ELSE 'DISCONNECTED' END AS connection_state
      FROM repositories r JOIN github_installations i ON i.installation_id = r.installation_id
      WHERE i.user_id = $1
      ORDER BY (r.connected AND i.status = 'active') DESC, r.full_name`,

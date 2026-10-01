@@ -1,11 +1,14 @@
 import { listInstallationsForReconcile, listMonitoredRepositories, purgeExpiredSessions } from "@/lib/db/accounts";
 import { listStaleOwnedDeployments, listStuckRiskAnalyses } from "@/lib/db/deployments";
 import { getPool } from "@/lib/db/client";
-import { claimRetry, finishDelivery, listRetryableDeliveries, pruneDeliveries } from "@/lib/db/webhook-deliveries";
-import { processWorkflowRun, recoverMissedPushes, refreshDeploymentFromActions } from "@/lib/github/app-events";
+import { listOrphanedDeliveries, pruneDeliveries } from "@/lib/db/webhook-deliveries";
+import { recoverMissedPushes, refreshDeploymentFromActions } from "@/lib/github/app-events";
 import { reconcileInstallation } from "@/lib/github/installations";
-import { startRiskAnalysis } from "@/lib/db/deployments";
-import { runRiskAnalysis } from "@/lib/risk/auto-risk";
+import { scheduleRiskAnalysis } from "@/lib/risk/auto-risk";
+import { enqueue, pruneSucceeded, queueStats, reclaimStuck, type QueueStats } from "@/lib/jobs/queue";
+import { JOB_TYPES } from "@/lib/jobs/types";
+import { drainQueue, type DrainReport } from "@/lib/jobs/runner";
+import { applyRetention, type RetentionReport } from "@/lib/lifecycle/retention";
 
 /**
  * Phase 10: the maintenance / reconciliation run.
@@ -15,12 +18,15 @@ import { runRiskAnalysis } from "@/lib/risk/auto-risk";
  * a serverless time limit. This run repairs that, in bounded steps:
  *
  *   1. housekeeping      expired sessions, old rate-limit windows, old delivery logs
- *   2. retry deliveries  workflow_run work that never finished (payload kept in the log)
+ *   2. queue             reclaim jobs of dead workers; re-queue deliveries whose job was lost
+ *                        (Stage 2: deferred work runs as jobs with retries + dead-letter)
  *   3. installations     re-read status + repository list from GitHub (uninstall,
  *                        suspension, added/removed repositories)
  *   4. missed pushes     push-triggered workflow runs whose push never arrived
  *   5. stale pipelines   deployments stuck in RECEIVED/BUILDING -> state from GitHub Actions
- *   6. stuck analyses    automatic risk analyses left "pending" -> run again
+ *   6. stuck analyses    automatic risk analyses left "pending" with no live job -> queued again
+ *   7. retention         failure output / old deployments past their retention period
+ *   8. drain             process queued jobs with the remaining time budget
  *
  * Every step has a count limit and the whole run a time budget, so it fits a
  * serverless invocation; the next run continues where this one stopped. It is
@@ -38,11 +44,16 @@ export type MaintenanceReport = {
   sessionsPurged: number;
   rateLimitRowsPurged: number;
   deliveriesPruned: number;
-  deliveriesRetried: { deliveryId: string; result: string }[];
+  jobsReclaimed: { requeued: number; dead: number };
+  jobsPruned: number;
+  deliveriesRequeued: string[];
   installations: { installationId: number; status: string; repositories?: number; note?: string }[];
   recoveredDeployments: string[];
   stalePipelines: { deploymentId: string; result: string }[];
   resumedRiskAnalyses: string[];
+  retention: RetentionReport | null;
+  drain: DrainReport | null;
+  queue: QueueStats | null;
   errors: string[];
 };
 
@@ -70,11 +81,16 @@ export async function runMaintenance(options: { budgetMs?: number } = {}): Promi
     sessionsPurged: 0,
     rateLimitRowsPurged: 0,
     deliveriesPruned: 0,
-    deliveriesRetried: [],
+    jobsReclaimed: { requeued: 0, dead: 0 },
+    jobsPruned: 0,
+    deliveriesRequeued: [],
     installations: [],
     recoveredDeployments: [],
     stalePipelines: [],
     resumedRiskAnalyses: [],
+    retention: null,
+    drain: null,
+    queue: null,
     errors: [],
   };
   const step = async (name: string, fn: () => Promise<void>) => {
@@ -108,19 +124,19 @@ export async function runMaintenance(options: { budgetMs?: number } = {}): Promi
     report.deliveriesPruned = await pruneDeliveries();
   });
 
-  // 2. unfinished deferred webhook work
-  await step("retry deliveries", async () => {
-    for (const d of await listRetryableDeliveries(LIMITS.deliveries)) {
-      if (!timeLeft()) break;
-      if (d.event !== "workflow_run" || !(await claimRetry(d.delivery_id))) continue;
-      try {
-        const result = await processWorkflowRun(d.payload as Parameters<typeof processWorkflowRun>[0]);
-        await finishDelivery(d.delivery_id, result.startsWith("ignored") ? "ignored" : "processed");
-        report.deliveriesRetried.push({ deliveryId: d.delivery_id, result });
-      } catch (error) {
-        await finishDelivery(d.delivery_id, "failed", (error as Error).message);
-        report.deliveriesRetried.push({ deliveryId: d.delivery_id, result: `failed: ${(error as Error).message}` });
-      }
+  await step("jobs housekeeping", async () => {
+    report.jobsPruned = await pruneSucceeded();
+  });
+
+  // 2. the queue: jobs of workers that died, deliveries whose job was lost
+  await step("reclaim jobs", async () => {
+    report.jobsReclaimed = await reclaimStuck();
+  });
+  await step("orphaned deliveries", async () => {
+    for (const d of await listOrphanedDeliveries(LIMITS.deliveries)) {
+      if (d.event !== "workflow_run") continue;
+      await enqueue(JOB_TYPES.workflowRun, { deliveryId: d.delivery_id }, { dedupeKey: `webhook:${d.delivery_id}`, maxAttempts: 8 });
+      report.deliveriesRequeued.push(d.delivery_id);
     }
   });
 
@@ -161,23 +177,36 @@ export async function runMaintenance(options: { budgetMs?: number } = {}): Promi
     }
   });
 
-  // 6. automatic risk analyses whose after() callback was lost. Runs inline
-  // (awaited), so it is not lost again. The stored-assessment reuse means no
-  // duplicate Gemini call if the lost attempt had actually finished.
+  // 6. automatic risk analyses left "pending" with no queued/running job
+  // (their job was lost or dead-lettered). A fresh attempt is queued; stored
+  // assessment reuse means no duplicate Gemini call if the lost one finished.
   await step("stuck risk analyses", async () => {
     for (const id of await listStuckRiskAnalyses(LIMITS.stuckRiskMinutes, LIMITS.stuckRisk)) {
       if (!timeLeft()) break;
-      const attempt = await startRiskAnalysis(id);
-      await runRiskAnalysis(id, attempt, "maintenance resume");
-      report.resumedRiskAnalyses.push(id);
+      if (await scheduleRiskAnalysis(id, "maintenance resume")) report.resumedRiskAnalyses.push(id);
     }
+  });
+
+  // 7. retention
+  await step("retention", async () => {
+    report.retention = await applyRetention();
+  });
+
+  // 8. drain the queue with whatever budget is left
+  await step("drain queue", async () => {
+    const remaining = budgetMs - (Date.now() - started);
+    report.drain = await drainQueue({ budgetMs: Math.max(0, remaining - 2_000), maxJobs: 100 });
+  });
+  await step("queue stats", async () => {
+    report.queue = await queueStats();
   });
 
   report.durationMs = Date.now() - started;
   console.log(
     `[DeployGuard][maintenance] Done in ${report.durationMs} ms: ${report.installations.length} installation(s), ` +
       `${report.recoveredDeployments.length} recovered push(es), ${report.stalePipelines.length} stale pipeline(s), ` +
-      `${report.deliveriesRetried.length} retried delivery(ies), ${report.resumedRiskAnalyses.length} resumed analysis(es), ` +
+      `${report.deliveriesRequeued.length} re-queued delivery(ies), ${report.drain?.processed ?? 0} job(s) run, ` +
+      `${report.queue?.dead ?? 0} dead-lettered job(s), ${report.resumedRiskAnalyses.length} resumed analysis(es), ` +
       `${report.errors.length} error(s).`
   );
   return report;

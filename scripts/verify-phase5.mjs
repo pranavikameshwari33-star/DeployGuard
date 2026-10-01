@@ -20,6 +20,7 @@
 import assert from "node:assert/strict";
 import pg from "pg";
 import { loadEnv } from "./load-env.mjs";
+import { waitForJob } from "./job-helpers.mjs";
 import { internalFetch } from "./internal-fetch.mjs";
 import { buildPushPayload, deliver } from "./test-payload.mjs";
 import { analyzeChanges, classifyFile } from "../lib/analysis/change-analysis.ts";
@@ -199,10 +200,12 @@ try {
   );
 
   console.log("\n6. Hindsight memory");
+  // Stage 2: the Hindsight write is a queued job (not inside the webhook request).
+  const memoryJob = await waitForJob(client, first.body.memory?.jobId);
   check(
-    first.body.memory?.stored === true,
-    "deployment memory (with analysis) written",
-    first.body.memory?.stored ? "" : first.body.memory?.error ?? "unknown reason"
+    first.body.memory?.queued === true && memoryJob?.status === "succeeded",
+    "deployment memory (with analysis) written (queued job succeeded)",
+    `queued=${first.body.memory?.queued}, job=${memoryJob?.status ?? "timeout"} ${memoryJob?.last_error ?? ""}`
   );
 
   const shortSha = payload.after.slice(0, 7);

@@ -22,7 +22,10 @@
     "verify:injection": "node scripts/verify-injection.mjs",
     "verify:csrf-and-auth": "node scripts/verify-csrf-and-auth.mjs",
     "verify:hindsight-canary": "node scripts/verify-hindsight-canary.mjs",
-    "db:redact-existing": "node --experimental-strip-types scripts/redact-existing.mjs"
+    "db:redact-existing": "node --experimental-strip-types scripts/redact-existing.mjs",
+    "verify:queue": "node --experimental-strip-types --no-warnings --import ./scripts/ts-alias.mjs scripts/verify-queue.mjs",
+    "verify:lifecycle": "node --experimental-strip-types --no-warnings --import ./scripts/ts-alias.mjs scripts/verify-lifecycle.mjs",
+    "verify:migrations": "node scripts/verify-migrations.mjs"
   },
   "dependencies": {
     "next": "16.3.6",

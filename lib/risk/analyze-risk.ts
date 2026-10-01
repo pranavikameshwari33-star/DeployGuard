@@ -7,6 +7,7 @@ import {
 import { retain } from "@/lib/hindsight/client";
 import { buildRiskMemory } from "@/lib/hindsight/risk-memory";
 import { buildRiskEvidence } from "@/lib/risk/evidence";
+import { reserveGeminiCall, tenantOf } from "@/lib/risk/usage";
 import { RISK_RESPONSE_SCHEMA, validateRiskAssessment } from "@/lib/risk/validate";
 
 /**
@@ -37,7 +38,7 @@ export type RiskAnalysisResult =
     }
   | {
       status: "unavailable";
-      reason: "gemini_error" | "invalid_response";
+      reason: "gemini_error" | "invalid_response" | "usage_limit";
       kind?: GeminiErrorKind;
       message: string;
       errors?: string[];
@@ -85,6 +86,17 @@ export async function analyzeDeploymentRisk(
   if (!options.refresh) {
     const stored = await findAssessmentByFingerprint(deploymentId, fingerprint);
     if (stored) return { status: "assessed", source: "stored", assessment: stored };
+  }
+
+  // --- Stage 2: per-repository usage cap (counted before the call is made) -----
+  const reservation = await reserveGeminiCall(tenantOf(built.deployment.github_repository_id));
+  if (!reservation.allowed) {
+    console.warn(`[DeployGuard][risk] Usage cap reached for deployment #${deploymentId} (${reservation.reason} cap ${reservation.cap}); Gemini not called.`);
+    return {
+      status: "unavailable",
+      reason: "usage_limit",
+      message: `Risk analysis unavailable: usage limit reached (${reservation.reason} cap of ${reservation.cap} analyses).`,
+    };
   }
 
   // --- Gemini ------------------------------------------------------------------

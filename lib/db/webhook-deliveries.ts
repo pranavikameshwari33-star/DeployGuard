@@ -1,5 +1,5 @@
 import { getPool } from "@/lib/db/client";
-import { redactText } from "@/lib/security/redact";
+import { redactDeep, redactText } from "@/lib/security/redact";
 
 /**
  * Stage 1: a stored workflow_run payload keeps everything processing needs,
@@ -10,7 +10,8 @@ import { redactText } from "@/lib/security/redact";
 function redactStoredPayload(payload: unknown): unknown {
   const p = payload as { workflow_run?: { display_title?: unknown; head_commit?: { message?: unknown } } };
   const run = p?.workflow_run;
-  if (!run) return payload;
+  if (!run) return redactDeep(payload).value; // any other event: every string redacted
+  
   return {
     ...(payload as object),
     workflow_run: {
@@ -112,30 +113,30 @@ export async function finishDelivery(deliveryId: string, status: DeliveryStatus,
   );
 }
 
-export type RetryableDelivery = { delivery_id: string; event: string; attempts: number; payload: unknown };
-
-/** Deferred deliveries that did not finish (crash, timeout, transient error) and still have attempts left. */
-export async function listRetryableDeliveries(limit: number): Promise<RetryableDelivery[]> {
-  const result = await getPool().query<RetryableDelivery>(
-    `SELECT delivery_id, event, attempts, payload FROM github_webhook_deliveries
-     WHERE payload IS NOT NULL AND attempts < $2
-       AND (status IN ('received', 'failed')
-            OR (status = 'processing' AND updated_at < now() - make_interval(mins => $3)))
-       AND updated_at < now() - interval '2 minutes'
-     ORDER BY received_at LIMIT $1`,
-    [limit, MAX_DELIVERY_ATTEMPTS, PROCESSING_STALE_MINUTES]
+/** Stage 2: the stored payload of a queued delivery (null once it has been processed). */
+export async function getDeliveryPayload(deliveryId: string): Promise<unknown | null> {
+  const result = await getPool().query<{ payload: unknown }>(
+    `SELECT payload FROM github_webhook_deliveries WHERE delivery_id = $1`,
+    [deliveryId]
   );
-  return result.rows;
+  return result.rows[0]?.payload ?? null;
 }
 
-/** Marks a delivery as being retried (so two maintenance runs do not both take it). */
-export async function claimRetry(deliveryId: string): Promise<boolean> {
-  const result = await getPool().query(
-    `UPDATE github_webhook_deliveries SET status = 'processing', attempts = attempts + 1, updated_at = now()
-     WHERE delivery_id = $1 AND status <> 'processing' OR (delivery_id = $1 AND updated_at < now() - make_interval(mins => $2))`,
-    [deliveryId, PROCESSING_STALE_MINUTES]
+/**
+ * Stage 2: deliveries whose work is still pending but which have NO live job
+ * (the enqueue was lost, or the delivery predates the queue). The maintenance
+ * run enqueues them again; the job dedupe key makes that idempotent.
+ */
+export async function listOrphanedDeliveries(limit: number): Promise<{ delivery_id: string; event: string }[]> {
+  const result = await getPool().query<{ delivery_id: string; event: string }>(
+    `SELECT d.delivery_id, d.event FROM github_webhook_deliveries d
+     WHERE d.payload IS NOT NULL AND d.status IN ('received', 'processing', 'failed')
+       AND d.updated_at < now() - interval '2 minutes'
+       AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.dedupe_key = 'webhook:' || d.delivery_id AND j.status IN ('queued', 'running'))
+     ORDER BY d.received_at LIMIT $1`,
+    [limit]
   );
-  return (result.rowCount ?? 0) > 0;
+  return result.rows;
 }
 
 /** Bounded pruning: finished deliveries after 14 days, failed ones after 30. */

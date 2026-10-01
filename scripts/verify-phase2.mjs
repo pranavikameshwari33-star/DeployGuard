@@ -15,6 +15,7 @@
  */
 import pg from "pg";
 import { loadEnv } from "./load-env.mjs";
+import { waitForJob } from "./job-helpers.mjs";
 import { internalFetch } from "./internal-fetch.mjs";
 import { buildPushPayload, deliver } from "./test-payload.mjs";
 
@@ -107,8 +108,11 @@ try {
 
   // --- 5. Hindsight memory --------------------------------------------------
   console.log("\n4. Hindsight memory");
-  if (first.body.memory?.stored) pass("memory written during the webhook call");
-  else fail("memory was not written", first.body.memory?.error ?? "unknown reason");
+  // Stage 2: the webhook no longer writes to Hindsight inside the request; it
+  // queues a job. The guarantee checked here is the same: the memory is written.
+  const memoryJob = await waitForJob(client, first.body.memory?.jobId);
+  if (first.body.memory?.queued && memoryJob?.status === "succeeded") pass("memory job queued by the webhook and written to Hindsight");
+  else fail("memory was not written", `queued=${first.body.memory?.queued}, job=${memoryJob?.status ?? "timeout"} ${memoryJob?.last_error ?? ""}`);
 
   const query = "deployment that changed the database configuration";
   const recallResponse = await internalFetch(

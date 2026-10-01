@@ -141,6 +141,12 @@ export async function POST(request: Request) {
     );
   }
 
+  // Stage 2: an out-of-date report (older than what was already applied) is a
+  // harmless no-op, not an error: the pipeline must not retry it.
+  if (result.outcome === "stale_event") {
+    return NextResponse.json({ ok: true, stage: "database", ignored: "out-of-date status report", status: result.currentStatus });
+  }
+
   const { deployment, previousStatus, incident, incidentMemory, memory } = result;
   return NextResponse.json({
     ok: true,
@@ -157,10 +163,11 @@ export async function POST(request: Request) {
           id: incident.incident.id,
           created: incident.isNew,
           failureType: incident.incident.failure_type,
-          memory: incidentMemory ? { stored: incidentMemory.stored } : undefined,
+          memory: incidentMemory ? { queued: incidentMemory.queued, jobId: incidentMemory.jobId } : undefined,
         }
       : undefined,
-    memory: "skipped" in memory ? memory : { stored: memory.stored },
+    // Stage 2: Hindsight writes are queued jobs, not done inside this request.
+    memory: "skipped" in memory ? memory : { queued: memory.queued, jobId: memory.jobId },
   });
 }
 

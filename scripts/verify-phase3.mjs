@@ -19,6 +19,7 @@
 import crypto from "node:crypto";
 import pg from "pg";
 import { loadEnv } from "./load-env.mjs";
+import { waitForJob } from "./job-helpers.mjs";
 import { buildPushPayload, deliver } from "./test-payload.mjs";
 
 loadEnv();
@@ -140,10 +141,12 @@ try {
     okRow?.status === "SUCCESS" && okRow.ci_run_id === "4242" && okRow.ci_finished_at && !okRow.failure_stage,
     "database row is SUCCESS with run id and finish time"
   );
+  // Stage 2: the Hindsight write is a queued job (not inside the CI request).
+  const finalMemoryJob = await waitForJob(client, r.body.memory?.jobId);
   check(
-    r.body.memory?.stored === true,
-    "final result written to Hindsight",
-    r.body.memory?.stored ? "" : r.body.memory?.error ?? "unknown reason"
+    r.body.memory?.queued === true && finalMemoryJob?.status === "succeeded",
+    "final result written to Hindsight (queued job succeeded)",
+    `queued=${r.body.memory?.queued}, job=${finalMemoryJob?.status ?? "timeout"} ${finalMemoryJob?.last_error ?? ""}`
   );
 
   // --- 5. failure path -------------------------------------------------------

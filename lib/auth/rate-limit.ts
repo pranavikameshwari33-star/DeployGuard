@@ -27,6 +27,8 @@ export const RATE_LIMITS = {
   ciStatus: { limit: 120, windowSeconds: 60 },          // POST /api/deployments/status, per source address
   memoryRecall: { limit: 60, windowSeconds: 10 * 60 },  // GET /api/memory/recall by a user (Hindsight call)
   riskAnalyze: { limit: 30, windowSeconds: 60 * 60 },   // POST /api/deployments/risk by a user (may call Gemini)
+  purge: { limit: 5, windowSeconds: 60 * 60 },          // Stage 2: repository / account purge, per user
+  export: { limit: 20, windowSeconds: 60 * 60 },        // Stage 2: data export, per user
 } satisfies Record<string, RateLimitRule>;
 
 /**

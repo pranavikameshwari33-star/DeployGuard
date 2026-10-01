@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getPool } from "@/lib/db/client";
 import { errorDetail, getViewer } from "@/lib/auth/session";
 import { countPendingDeliveries } from "@/lib/db/webhook-deliveries";
+import { queueStats } from "@/lib/jobs/queue";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -38,8 +39,9 @@ export async function GET() {
     const viewer = await getViewer().catch(() => null);
     if (viewer?.kind === "internal") {
       try {
-        const [pendingDeliveries, stats] = await Promise.all([
+        const [pendingDeliveries, queue, stats] = await Promise.all([
           countPendingDeliveries(),
+          queueStats(),
           getPool().query<{ pending_risk: number; last_reconciled: Date | null; active_installations: number }>(
             `SELECT (SELECT count(*)::int FROM deployments WHERE risk_analysis_status = 'pending') AS pending_risk,
                     (SELECT max(last_synced_at) FROM github_installations) AS last_reconciled,
@@ -51,6 +53,8 @@ export async function GET() {
           pendingRiskAnalyses: stats.rows[0].pending_risk,
           activeInstallations: stats.rows[0].active_installations,
           lastReconciledAt: stats.rows[0].last_reconciled,
+          // Stage 2: the job queue.
+          queue,
         };
       } catch (error) {
         body.operations = errorDetail(viewer, (error as Error).message);

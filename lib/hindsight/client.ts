@@ -1,5 +1,6 @@
 import { env, findServerSecretIn } from "@/lib/env";
-import { redactDeep } from "@/lib/security/redact";
+import { redactDeep, redactText } from "@/lib/security/redact";
+import { trackRetainedDocument } from "@/lib/hindsight/documents";
 import { assertRetainScope, filterRecallResults, recallTagRequests, type ScopedRecall } from "@/lib/hindsight/scope";
 
 /**
@@ -16,11 +17,12 @@ import { assertRetainScope, filterRecallResults, recallTagRequests, type ScopedR
  */
 
 export class HindsightError extends Error {
-  constructor(
-    message: string,
-    readonly status?: number
-  ) {
+  // A plain field (not a constructor parameter property) so Node's type
+  // stripping can load this module in the verification scripts.
+  readonly status?: number;
+  constructor(message: string, status?: number) {
     super(message);
+    this.status = status;
     this.name = "HindsightError";
   }
 }
@@ -28,17 +30,21 @@ export class HindsightError extends Error {
 const TIMEOUT_MS = 20_000;
 
 async function post<T>(path: string, body: unknown): Promise<T> {
+  return request<T>("POST", path, body);
+}
+
+async function request<T>(method: "POST" | "GET" | "DELETE", path: string, body?: unknown): Promise<T> {
   const url = `${env.hindsightBaseUrl()}${path}`;
 
   let response: Response;
   try {
     response = await fetch(url, {
-      method: "POST",
+      method,
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${env.hindsightApiKey()}`,
       },
-      body: JSON.stringify(body),
+      body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
   } catch (error) {
@@ -55,7 +61,7 @@ async function post<T>(path: string, body: unknown): Promise<T> {
     // Hindsight echoes back a validation message, not our credentials, so this
     // is safe to surface. Truncated to keep logs readable.
     throw new HindsightError(
-      `Hindsight responded ${response.status}: ${text.slice(0, 300)}`,
+      `Hindsight responded ${response.status}: ${redactText(text.slice(0, 300))}`,
       response.status
     );
   }
@@ -91,10 +97,39 @@ export async function retain(item: MemoryItem, bankId = env.hindsightBankId()) {
   const { value: safe } = redactDeep(item);
   const leaked = findServerSecretIn(JSON.stringify(safe));
   if (leaked) throw new HindsightError(`Refusing to retain: the memory contains the value of ${leaked}.`);
-  return post<RetainResponse>(
+  const response = await post<RetainResponse>(
     `/v1/default/banks/${encodeURIComponent(bankId)}/memories`,
     { items: [safe], async: false }
   );
+  // Stage 2: remember every document we wrote, so a purge can delete exactly them.
+  await trackRetainedDocument(safe).catch((error) =>
+    console.error(`[DeployGuard][memory] Could not record document ${safe.document_id}: ${(error as Error).message}`)
+  );
+  return response;
+}
+
+const bankPath = (bankId: string) => `/v1/default/banks/${encodeURIComponent(bankId)}`;
+
+/** Stage 2: deletes one document and every memory extracted from it. A missing document is not an error. */
+export async function deleteDocument(documentId: string, bankId = env.hindsightBankId()): Promise<"deleted" | "absent"> {
+  try {
+    await request("DELETE", `${bankPath(bankId)}/documents/${encodeURIComponent(documentId)}`);
+    return "deleted";
+  } catch (error) {
+    if (error instanceof HindsightError && error.status === 404) return "absent";
+    throw error;
+  }
+}
+
+/** Stage 2: whether Hindsight still holds a document (used to VERIFY a deletion). */
+export async function documentExists(documentId: string, bankId = env.hindsightBankId()): Promise<boolean> {
+  try {
+    await request("GET", `${bankPath(bankId)}/documents/${encodeURIComponent(documentId)}`);
+    return true;
+  } catch (error) {
+    if (error instanceof HindsightError && error.status === 404) return false;
+    throw error;
+  }
 }
 
 export type RecallResult = {
