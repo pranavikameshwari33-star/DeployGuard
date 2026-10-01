@@ -274,10 +274,6 @@ export function validateRiskAssessment(raw: unknown, evidence: RiskEvidence): Va
     ...evidence.historical_evidence.matches.flatMap((m) => (m.incident ? [m.incident.id] : [])),
     ...(evidence.current_pipeline.incident ? [evidence.current_pipeline.incident.id] : []),
   ]);
-  const prose = [summary ?? "", ...reasons.map((x) => x.reason), ...cited.map((x) => x.relevance_note)].join("\n");
-  for (const id of referencedIds(prose)) {
-    if (!knownIds.has(id)) errors.push(`text refers to deployment/incident #${id}, which was not in the supplied evidence`);
-  }
 
   // --- lists ---------------------------------------------------------------------
   const missing = stringList(r.missing_information, LIMITS.missing, LIMITS.reason);
@@ -286,6 +282,19 @@ export function validateRiskAssessment(raw: unknown, evidence: RiskEvidence): Va
   if (checks === null || checks.length === 0) {
     errors.push(`recommended_checks must be an array of 1-${LIMITS.checks} strings`);
   }
+
+  // Stage 1: EVERY free-text field is checked, not only summary and reasons.
+  const prose = [
+    summary ?? "",
+    ...reasons.map((x) => x.reason),
+    ...cited.map((x) => x.relevance_note),
+    ...(missing ?? []),
+    ...(checks ?? []),
+  ].join("\n");
+  for (const id of referencedIds(prose)) {
+    if (!knownIds.has(id)) errors.push(`text refers to deployment/incident #${id}, which was not in the supplied evidence`);
+  }
+  errors.push(...checkUntrustedProse(prose, evidence));
 
   if (errors.length > 0) return { ok: false, errors };
 
@@ -325,6 +334,67 @@ function stringList(value: unknown, maxItems: number, maxLength: number): string
   if (!Array.isArray(value) || value.length > maxItems) return null;
   const items = value.map((v) => text(v, maxLength));
   return items.every((v) => v !== null) ? (items as string[]) : null;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1: checks on the model's free text (injection / hallucination defence)
+// ---------------------------------------------------------------------------
+
+/** Upper bound on all free text together, beyond the per-field limits. */
+export const MAX_TOTAL_PROSE = 8000;
+
+const HEDGE_OR_UNKNOWN =
+  /\b(unknown|not known|not determined|not recorded|undetermined|unclear|unconfirmed|no (?:recorded |known )?root cause|null|may|might|could|possibly|potentially|perhaps|whether|if)\b/i;
+
+/** Assertive claims about a cause or a fix. Allowed only when the bundle holds an attested one. */
+const ROOT_CAUSE_CLAIMS: { kind: "root_cause" | "resolution"; pattern: RegExp }[] = [
+  { kind: "root_cause", pattern: /\broot[- ]cause\s*(?:is|was|were|appears to be|:)/i },
+  { kind: "root_cause", pattern: /\b(?:is|was|were|are)\s+(?:directly\s+|ultimately\s+)?caused\s+by\b/i },
+  { kind: "resolution", pattern: /\b(?:was|were|is|has been)\s+(?:resolved|fixed)\s+by\b/i },
+];
+
+/**
+ * Rejects free text that:
+ *  - contains a URL that is not present verbatim in the bundle, or a non-http link scheme;
+ *  - contains HTML markup or markdown links/images (output is shown to people);
+ *  - asserts a root cause / resolution while the bundle holds no attested one
+ *    (hedged or "unknown" statements are fine);
+ *  - is excessively long overall.
+ */
+export function checkUntrustedProse(prose: string, evidence: RiskEvidence): string[] {
+  const errors: string[] = [];
+  const bundleText = JSON.stringify(evidence);
+
+  if (prose.length > MAX_TOTAL_PROSE) errors.push(`free text is ${prose.length} characters; the limit is ${MAX_TOTAL_PROSE}`);
+
+  for (const m of prose.matchAll(/\b(?:https?|ftp):\/\/[^\s<>"'`)\]]+/gi)) {
+    const url = m[0].replace(/[.,;:!?]+$/, "");
+    if (!bundleText.includes(url)) errors.push(`text contains a URL that is not in the supplied evidence: ${url.slice(0, 100)}`);
+  }
+  if (/\b(?:javascript|data|vbscript|file):/i.test(prose)) errors.push("text contains a non-http link scheme");
+  if (/<\s*\/?\s*(?:script|iframe|img|svg|a|style|object|embed|form|input|link|meta|base)\b/i.test(prose)) {
+    errors.push("text contains HTML markup");
+  }
+  if (/!?\[[^\]\n]*\]\([^)\n]*\)/.test(prose)) errors.push("text contains a markdown link");
+
+  const incidents = [
+    evidence.current_pipeline.incident,
+    ...evidence.historical_evidence.matches.map((m) => m.incident),
+  ].filter((i): i is EvidenceIncident => i !== null);
+  const attested = {
+    root_cause: incidents.some((i) => Boolean(i.root_cause)),
+    resolution: incidents.some((i) => Boolean(i.resolution)),
+  };
+  for (const sentence of prose.split(/(?<=[.!?])\s+|\n+/)) {
+    if (HEDGE_OR_UNKNOWN.test(sentence)) continue;
+    for (const claim of ROOT_CAUSE_CLAIMS) {
+      if (!attested[claim.kind] && claim.pattern.test(sentence)) {
+        errors.push(`text asserts a ${claim.kind.replace("_", " ")} that no attested record supplies: "${sentence.slice(0, 120)}"`);
+        break;
+      }
+    }
+  }
+  return errors;
 }
 
 /** Ids written as "#12", "deployment 12", "deployments #12", "incident #5". */

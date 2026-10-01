@@ -10,6 +10,8 @@ import { branchFromRef, parsePushEvent, type PushEvent } from "@/lib/github/pars
 import { recordPushEvent } from "@/lib/store/event-store";
 import { ingestPush } from "@/lib/pipeline/ingest-push";
 import { beginDelivery, finishDelivery, type DeliveryStatus } from "@/lib/db/webhook-deliveries";
+import { rateLimitResponse } from "@/lib/auth/rate-limit";
+import { redactPushEvent } from "@/lib/pipeline/ingest-push";
 
 // node:crypto is not available on the Edge runtime, so pin this to Node.
 export const runtime = "nodejs";
@@ -45,6 +47,10 @@ export const dynamic = "force-dynamic";
  *                        delivery.
  */
 export async function POST(request: Request) {
+  // Stage 1: per-source rate limit, before any parsing or signature work.
+  const limited = await rateLimitResponse(request, "webhook");
+  if (limited) return limited;
+
   // ---------- stage 1: authenticity ----------
   const secret = process.env.GITHUB_WEBHOOK_SECRET;
 
@@ -53,7 +59,7 @@ export async function POST(request: Request) {
       "[DeployGuard] GITHUB_WEBHOOK_SECRET is not set. Add it to .env.local and restart the dev server."
     );
     return NextResponse.json(
-      { ok: false, stage: "config", error: "Server is not configured: GITHUB_WEBHOOK_SECRET is missing." },
+      { ok: false, stage: "config", error: "Server is not configured." },
       { status: 500 }
     );
   }
@@ -186,7 +192,8 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: true, ignored: "branch deleted" });
   }
 
-  const event = parsePushEvent(payload, deliveryId);
+  // Stage 1: commit message redacted before it is logged, kept in memory or stored.
+  const event = redactPushEvent(parsePushEvent(payload, deliveryId));
   recordPushEvent(event); // in-memory receipt log, so /api/events works even if the DB is down
   logPushEvent(event);
 
@@ -252,7 +259,7 @@ export async function POST(request: Request) {
     },
     memory: memory?.stored
       ? { stored: true }
-      : { stored: false, error: memory?.error, note: "Deployment record is stored in the database." },
+      : { stored: false, note: "Deployment record is stored in the database; the memory write is logged server-side." },
   });
 }
 

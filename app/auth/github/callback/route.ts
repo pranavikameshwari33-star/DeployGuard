@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { OAUTH_STATE_COOKIE, SESSION_COOKIE, cookieOptions, getViewer } from "@/lib/auth/session";
-import { SESSION_TTL_DAYS, createSession, upsertUser } from "@/lib/db/accounts";
+import { SESSION_TTL_DAYS, createSession, deleteSession, upsertUser } from "@/lib/db/accounts";
 import { exchangeCodeForUserToken, getAuthenticatedUser } from "@/lib/github/app";
 import { claimUserInstallations } from "@/lib/github/installations";
 import { rateLimitResponse } from "@/lib/auth/rate-limit";
@@ -116,6 +116,10 @@ export async function GET(request: Request) {
   } catch (error) {
     console.warn(`[DeployGuard][auth] Could not look up installations at sign-in: ${(error as Error).message}`);
   }
+  // Stage 1: session rotation. Any session this browser already had is revoked
+  // server-side, so a session id planted before sign-in is never upgraded.
+  const previous = jar.get(SESSION_COOKIE)?.value;
+  if (previous) await deleteSession(previous).catch(() => {});
   const session = await createSession(user.id);
   console.log(`[DeployGuard][auth] Signed in @${user.github_login}.`);
 

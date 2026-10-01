@@ -14,7 +14,7 @@ export const dynamic = "force-dynamic";
  *
  * Read-only. Reads PostgreSQL only; never calls Gemini or Hindsight.
  * Phase 9: limited to the signed-in user's repositories (internal tooling with
- * Bearer DEPLOYGUARD_STATUS_TOKEN sees everything).
+ * Bearer DEPLOYGUARD_INTERNAL_TOKEN sees everything).
  */
 export async function GET(request: Request) {
   const viewer = await getViewer();

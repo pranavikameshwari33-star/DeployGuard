@@ -36,6 +36,8 @@ loadEnv();
 const BASE = process.env.APP_URL || "http://localhost:3000";
 const webhookSecret = process.env.GITHUB_WEBHOOK_SECRET;
 const statusToken = process.env.DEPLOYGUARD_STATUS_TOKEN;
+// Stage 1: the risk-analysis route is internal tooling; it accepts the internal token, not the CI status token.
+const internalToken = process.env.DEPLOYGUARD_INTERNAL_TOKEN;
 const connectionString = process.env.DATABASE_URL;
 
 let failures = 0;
@@ -83,7 +85,7 @@ async function report(pushed, status, failure) {
   if (!response.ok) throw new Error(`status report ${status} failed: HTTP ${response.status}`);
 }
 
-async function assess(id, { token = statusToken, countsAsGemini = true } = {}) {
+async function assess(id, { token = internalToken, countsAsGemini = true } = {}) {
   const response = await fetch(`${BASE}/api/deployments/risk?id=${id}`, {
     method: "POST",
     headers: token ? { Authorization: `Bearer ${token}` } : {},

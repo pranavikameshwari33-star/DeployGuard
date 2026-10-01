@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { canAccessDeployment, errorDetail, getViewer } from "@/lib/auth/session";
 import { getDeploymentById } from "@/lib/db/deployments";
 import { rateLimitResponse } from "@/lib/auth/rate-limit";
+import { checkSameOrigin } from "@/lib/auth/csrf";
 import { getLatestAssessment } from "@/lib/db/risk-assessments";
 import { analyzeDeploymentRisk } from "@/lib/risk/analyze-risk";
 
@@ -12,7 +13,8 @@ export const dynamic = "force-dynamic";
  * Phase 7: AI deployment risk analysis.
  *
  * POST /api/deployments/risk?id=<deploymentId>[&refresh=1]
- *   Authorization: Bearer <DEPLOYGUARD_STATUS_TOKEN>  -- or the owner's signed-in session (Phase 9)
+ *   Authorization: Bearer <DEPLOYGUARD_INTERNAL_TOKEN>  -- or the owner's signed-in session (Phase 9)
+ *   A session-authenticated call must come from DeployGuard's own origin (Stage 1 CSRF check).
  *   Gathers the evidence (Phase 5 + Phase 6), asks Gemini, validates, stores.
  *   Reuses the stored assessment when the facts have not changed; refresh=1
  *   forces a new Gemini call. Protected because each call can cost Gemini
@@ -25,7 +27,7 @@ export const dynamic = "force-dynamic";
  * "unavailable" -- never a made-up risk level.
  */
 export async function POST(request: Request) {
-  // Internal tooling (Bearer DEPLOYGUARD_STATUS_TOKEN) or, since Phase 9, the
+  // Internal tooling (Bearer DEPLOYGUARD_INTERNAL_TOKEN) or, since Phase 9, the
   // signed-in owner of the deployment. Anyone else gets 401 / 404.
   const viewer = await getViewer();
   if (!viewer) return NextResponse.json({ ok: false, error: "Unauthorized." }, { status: 401 });
@@ -36,10 +38,18 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: false, error: "Add a numeric deployment id: ?id=12" }, { status: 400 });
   }
   if (viewer.kind === "user") {
+    const csrf = checkSameOrigin(request);
+    if (!csrf.ok) {
+      console.warn(`[DeployGuard][csrf] Rejected risk analysis request: ${csrf.reason}.`);
+      return NextResponse.json({ ok: false, error: "Request rejected." }, { status: 403 });
+    }
     const deployment = await getDeploymentById(id);
     if (!deployment || !canAccessDeployment(viewer, deployment)) {
       return NextResponse.json({ ok: false, error: `No deployment #${id}.` }, { status: 404 });
     }
+    // Stage 1: any analysis request may call Gemini; limit it per user.
+    const limitedAll = await rateLimitResponse(request, "riskAnalyze", `user:${viewer.user.id}`);
+    if (limitedAll) return limitedAll;
     // Phase 10: a forced refresh always calls Gemini; limit it per user.
     if (params.get("refresh") === "1") {
       const limited = await rateLimitResponse(request, "riskRefresh", `user:${viewer.user.id}`);

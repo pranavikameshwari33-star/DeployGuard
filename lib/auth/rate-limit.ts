@@ -22,11 +22,30 @@ export const RATE_LIMITS = {
   authInstall: { limit: 30, windowSeconds: 10 * 60 },   // GET /auth/github/install
   authLogout: { limit: 60, windowSeconds: 10 * 60 },    // POST /auth/logout
   riskRefresh: { limit: 10, windowSeconds: 60 * 60 },   // POST /api/deployments/risk?refresh=1 by a user (Gemini cost)
+  // Stage 1: intake and expensive endpoints.
+  webhook: { limit: 600, windowSeconds: 60 },           // POST /api/webhook/github, per source address
+  ciStatus: { limit: 120, windowSeconds: 60 },          // POST /api/deployments/status, per source address
+  memoryRecall: { limit: 60, windowSeconds: 10 * 60 },  // GET /api/memory/recall by a user (Hindsight call)
+  riskAnalyze: { limit: 30, windowSeconds: 60 * 60 },   // POST /api/deployments/risk by a user (may call Gemini)
 } satisfies Record<string, RateLimitRule>;
 
-/** A client key from the request: hashed, so no raw IP address is ever stored. */
+/**
+ * A client key from the request: hashed, so no raw IP address is ever stored.
+ *
+ * Stage 1 fix: the LEFTMOST X-Forwarded-For entry is whatever the client chose
+ * to send, so keying on it let anyone dodge every limit by rotating a header.
+ * Each proxy APPENDS the address it saw, so the trustworthy entry is counted
+ * from the RIGHT: with N trusted proxies in front of DeployGuard
+ * (DEPLOYGUARD_TRUSTED_PROXY_HOPS, default 1 -- e.g. ngrok, Vercel, one
+ * reverse proxy), the client is the Nth entry from the right.
+ */
 export function clientKey(request: Request): string {
-  const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+  const hops = Math.max(1, Number(process.env.DEPLOYGUARD_TRUSTED_PROXY_HOPS) || 1);
+  const chain = (request.headers.get("x-forwarded-for") ?? "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const forwarded = chain.length ? chain[Math.max(0, chain.length - hops)] : undefined;
   const ip = forwarded || request.headers.get("x-real-ip") || "unknown";
   return crypto.createHash("sha256").update(`deployguard-rl:${ip}`).digest("hex").slice(0, 32);
 }

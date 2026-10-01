@@ -1,4 +1,6 @@
-import { env } from "@/lib/env";
+import { env, findServerSecretIn } from "@/lib/env";
+import { redactDeep } from "@/lib/security/redact";
+import { assertRetainScope, filterRecallResults, recallTagRequests, type ScopedRecall } from "@/lib/hindsight/scope";
 
 /**
  * A tiny HTTP client for the Hindsight memory API.
@@ -75,11 +77,23 @@ export type MemoryItem = {
 
 export type RetainResponse = { success?: boolean; items_processed?: number };
 
-/** Stores one memory in a bank. */
+/**
+ * Stores one memory in a bank.
+ *
+ * Stage 1 guards, in order: the item must be scoped to exactly one tenant
+ * (ghrepo: tag, stable document_id, update_mode "replace"); every string in it
+ * is redacted; and as a last tripwire the request is refused if it still
+ * contains the value of any server secret. Each guard throws, so the caller
+ * sees a normal "memory write failed" -- the database record is unaffected.
+ */
 export async function retain(item: MemoryItem, bankId = env.hindsightBankId()) {
+  assertRetainScope(item);
+  const { value: safe } = redactDeep(item);
+  const leaked = findServerSecretIn(JSON.stringify(safe));
+  if (leaked) throw new HindsightError(`Refusing to retain: the memory contains the value of ${leaked}.`);
   return post<RetainResponse>(
     `/v1/default/banks/${encodeURIComponent(bankId)}/memories`,
-    { items: [item], async: false }
+    { items: [safe], async: false }
   );
 }
 
@@ -96,25 +110,36 @@ export type RecallResult = {
 
 export type RecallResponse = { results: RecallResult[] };
 
-/** Semantic search over a bank's memories. */
+/**
+ * Semantic search over a bank's memories, ALWAYS within a tenant scope.
+ *
+ * The scope (authorised GitHub repository ids) becomes the ghrepo: tag filter
+ * with tags_match "any_strict" (or, when narrowed, one all_strict call per
+ * tenant); there is no way to call this without one.
+ * `narrowTags` (e.g. deployment:12) are applied to the returned results and
+ * can only remove results, never add any.
+ */
 export async function recall(
   query: string,
-  options: {
-    bankId?: string;
-    maxTokens?: number;
-    tags?: string[];
-    /** 'any' also returns untagged memories; 'any_strict' returns only memories carrying one of the tags. */
-    tagsMatch?: "any" | "any_strict";
-  } = {}
-) {
-  const bankId = options.bankId ?? env.hindsightBankId();
-  return post<RecallResponse>(
-    `/v1/default/banks/${encodeURIComponent(bankId)}/memories/recall`,
-    {
-      query,
-      max_tokens: options.maxTokens ?? 2048,
-      budget: "mid",
-      ...(options.tags?.length ? { tags: options.tags, tags_match: options.tagsMatch ?? "any" } : {}),
-    }
+  scope: ScopedRecall & { bankId?: string; maxTokens?: number }
+): Promise<RecallResponse> {
+  const requests = recallTagRequests(scope);
+  const bankId = scope.bankId ?? env.hindsightBankId();
+  const responses = await Promise.all(
+    requests.map((filter) =>
+      post<RecallResponse>(`/v1/default/banks/${encodeURIComponent(bankId)}/memories/recall`, {
+        query,
+        max_tokens: scope.maxTokens ?? 2048,
+        budget: "mid",
+        ...filter,
+      })
+    )
   );
+  // Several per-tenant calls may return the same memory only if it carries two
+  // tenant tags, which filterRecallResults drops anyway; dedupe by id regardless.
+  const byId = new Map<string, RecallResult>();
+  for (const memory of responses.flatMap((r) => r.results ?? [])) {
+    if (!byId.has(memory.id)) byId.set(memory.id, memory);
+  }
+  return { results: filterRecallResults([...byId.values()], scope) };
 }

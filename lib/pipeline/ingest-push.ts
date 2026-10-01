@@ -4,6 +4,26 @@ import type { PushEvent } from "@/lib/github/parse-push-event";
 import { retain } from "@/lib/hindsight/client";
 import { buildDeploymentMemory } from "@/lib/hindsight/deployment-memory";
 import { scheduleRiskAnalysis } from "@/lib/risk/auto-risk";
+import { redact } from "@/lib/security/redact";
+
+/**
+ * Stage 1: the commit message is untrusted and may contain credentials; it is
+ * redacted before it is logged, stored or remembered. Idempotent, so applying
+ * it again (webhook route, then ingestPush) changes nothing.
+ */
+export function redactPushEvent(event: PushEvent): PushEvent {
+  const message = redact(event.commitMessage);
+  if (message.count === 0) return event;
+  const previous = event.commitMessageRedaction;
+  return {
+    ...event,
+    commitMessage: message.text,
+    commitMessageRedaction: {
+      count: message.count + (previous?.count ?? 0),
+      categories: [...new Set([...(previous?.categories ?? []), ...message.categories])].sort(),
+    },
+  };
+}
 
 /**
  * The push -> deployment pipeline: Phase 5 change analysis -> Phase 2 database
@@ -31,6 +51,15 @@ export async function ingestPush(
   repositoryId: string | null,
   options: { autoRisk: boolean; source: string }
 ): Promise<IngestResult> {
+  // Stage 1: every ingestion path (webhook, recovered push) is redacted here.
+  event = redactPushEvent(event);
+  if (event.commitMessageRedaction) {
+    console.warn(
+      `[DeployGuard][redaction] Commit ${event.commitSha.slice(0, 7)}: masked ${event.commitMessageRedaction.count} ` +
+        `item(s) in the commit message (${event.commitMessageRedaction.categories.join(", ")}).`
+    );
+  }
+
   // Phase 5: classify the changed files by path (deterministic, no I/O).
   const analysis = analyzeChanges({
     added: event.addedFiles,

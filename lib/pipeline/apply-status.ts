@@ -10,6 +10,7 @@ import { retain } from "@/lib/hindsight/client";
 import { buildDeploymentMemory } from "@/lib/hindsight/deployment-memory";
 import { buildIncidentMemory } from "@/lib/hindsight/incident-memory";
 import { scheduleRiskAnalysis } from "@/lib/risk/auto-risk";
+import { mergeSummaries, prepareFailureOutput, redact } from "@/lib/security/redact";
 
 /**
  * The deployment lifecycle update: Phase 3 status -> Phase 4 incident ->
@@ -43,6 +44,17 @@ export async function applyPipelineStatus(
   source: string
 ): Promise<ApplyStatusResult> {
   const label = `${key.owner}/${key.repository}@${key.branch} ${key.commitSha.slice(0, 7)}`;
+
+  // ---------- Stage 1: redaction before anything is stored ----------
+  // Every status source (CI reporter, workflow_run, reconciliation) passes here,
+  // so this is the one place failure output enters the database.
+  update = redactStatusUpdate(update);
+  if (update.failureRedaction?.count) {
+    console.warn(
+      `[DeployGuard][redaction] ${label}: masked ${update.failureRedaction.count} item(s) in the failure output ` +
+        `(${update.failureRedaction.categories.join(", ")}).`
+    );
+  }
 
   // ---------- database (source of truth) ----------
   const result = await updateDeploymentStatus(key, update);
@@ -126,6 +138,28 @@ export async function applyPipelineStatus(
   if (riskRefreshScheduled) await scheduleRiskAnalysis(deployment.id, `ci ${deployment.status}`);
 
   return { outcome: "updated", deployment, previousStatus, incident, incidentMemory, memory, riskRefreshScheduled };
+}
+
+/**
+ * The failure fields as they may be stored: output redacted and cut to the
+ * last 40 lines / 500 chars per line / 4000 chars; stage and job names
+ * redacted and length-capped. Exported for the verification scripts.
+ */
+export function redactStatusUpdate(update: StatusUpdate): StatusUpdate {
+  if (!update.failure) return update;
+  const output = prepareFailureOutput(update.failure.message);
+  const stage = redact(update.failure.stage);
+  const job = redact(update.failure.job);
+  const summary = mergeSummaries(output, stage, job);
+  return {
+    ...update,
+    failure: {
+      stage: update.failure.stage === undefined ? undefined : stage.text.slice(0, 50),
+      job: update.failure.job === undefined ? undefined : job.text.slice(0, 200),
+      message: update.failure.message === undefined ? undefined : output.text || undefined,
+    },
+    failureRedaction: summary.count ? summary : undefined,
+  };
 }
 
 function settled(result: PromiseSettledResult<unknown>): MemoryWrite {

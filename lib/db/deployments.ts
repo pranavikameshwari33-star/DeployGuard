@@ -53,7 +53,12 @@ export type Deployment = {
   repository_id: string | null;
   /** Phase 9: GitHub's immutable repository id from the push payload. */
   github_repository_id: string | null;
+  /** Stage 1: what kind of content was redacted from this record (counts/categories, never values). */
+  redaction: DeploymentRedaction | null;
 };
+
+export type RedactionCount = { count: number; categories: string[] };
+export type DeploymentRedaction = { commit_message?: RedactionCount; failure_output?: RedactionCount };
 
 export type RiskAnalysisStatus = "pending" | "completed" | "unavailable";
 
@@ -69,7 +74,7 @@ const COLUMNS = `
   updated_at, ci_run_id, ci_run_url, ci_started_at, ci_finished_at,
   failure_stage, failure_job, failure_message, file_analysis, change_categories,
   affected_services, risk_analysis_status, risk_analysis_error, risk_analysis_updated_at,
-  repository_id, github_repository_id
+  repository_id, github_repository_id, redaction
 `;
 
 /**
@@ -100,9 +105,9 @@ export async function insertDeployment(
        repository, owner, branch, commit_sha, commit_message, author,
        changed_files, added_files, modified_files, deleted_files, status,
        file_analysis, change_categories, affected_services,
-       repository_id, github_repository_id
+       repository_id, github_repository_id, redaction
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'RECEIVED', $11::jsonb, $12, $13, $14, $15)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'RECEIVED', $11::jsonb, $12, $13, $14, $15, $16::jsonb)
      ON CONFLICT (owner, repository, branch, commit_sha) DO NOTHING
      RETURNING ${COLUMNS}`,
     [
@@ -121,6 +126,7 @@ export async function insertDeployment(
       analysis.services,
       repositoryId,
       event.githubRepositoryId,
+      event.commitMessageRedaction?.count ? JSON.stringify({ commit_message: event.commitMessageRedaction }) : null,
     ]
   );
 
@@ -346,6 +352,8 @@ export type StatusUpdate = {
   ciRunId?: string;
   ciRunUrl?: string;
   failure?: { stage?: string; job?: string; message?: string };
+  /** Stage 1: set by the lifecycle when the failure output had something masked. */
+  failureRedaction?: RedactionCount;
 };
 
 export type UpdateResult =
@@ -385,7 +393,9 @@ export async function updateDeploymentStatus(
        ci_finished_at  = CASE WHEN $5::text = 'BUILDING' THEN NULL ELSE now() END,
        failure_stage   = $9,
        failure_job     = $10,
-       failure_message = $11
+       failure_message = $11,
+       redaction       = CASE WHEN $12::jsonb IS NULL THEN d.redaction
+                              ELSE COALESCE(d.redaction, '{}'::jsonb) || $12::jsonb END
      FROM prev
      WHERE d.id = prev.id AND prev.status = ANY($6::text[])
      RETURNING d.*, prev.status AS previous_status`,
@@ -401,6 +411,7 @@ export async function updateDeploymentStatus(
       isFailed ? update.failure?.stage ?? null : null,
       isFailed ? update.failure?.job ?? null : null,
       isFailed ? update.failure?.message ?? null : null,
+      isFailed && update.failureRedaction?.count ? JSON.stringify({ failure_output: update.failureRedaction }) : null,
     ]
   );
 

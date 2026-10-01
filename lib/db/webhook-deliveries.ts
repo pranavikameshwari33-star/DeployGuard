@@ -1,4 +1,27 @@
 import { getPool } from "@/lib/db/client";
+import { redactText } from "@/lib/security/redact";
+
+/**
+ * Stage 1: a stored workflow_run payload keeps everything processing needs,
+ * but the free text GitHub copies into it from the commit (head commit message,
+ * run title) is redacted first. Processing reads ids, SHAs, branch and
+ * conclusion only, which redaction leaves untouched.
+ */
+function redactStoredPayload(payload: unknown): unknown {
+  const p = payload as { workflow_run?: { display_title?: unknown; head_commit?: { message?: unknown } } };
+  const run = p?.workflow_run;
+  if (!run) return payload;
+  return {
+    ...(payload as object),
+    workflow_run: {
+      ...run,
+      ...(typeof run.display_title === "string" ? { display_title: redactText(run.display_title) } : {}),
+      ...(run.head_commit && typeof run.head_commit.message === "string"
+        ? { head_commit: { ...run.head_commit, message: redactText(run.head_commit.message) } }
+        : {}),
+    },
+  };
+}
 
 /**
  * Phase 10: the GitHub webhook delivery log (github_webhook_deliveries).
@@ -66,7 +89,7 @@ export async function beginDelivery(input: {
       input.action,
       input.installationId,
       input.githubRepositoryId,
-      input.payload === undefined ? null : JSON.stringify(input.payload),
+      input.payload === undefined ? null : JSON.stringify(redactStoredPayload(input.payload)),
       PROCESSING_STALE_MINUTES,
     ]
   );
@@ -85,7 +108,7 @@ export async function finishDelivery(deliveryId: string, status: DeliveryStatus,
      SET status = $2, last_error = $3, updated_at = now(),
          payload = CASE WHEN $2 IN ('processed', 'ignored') THEN NULL ELSE payload END
      WHERE delivery_id = $1`,
-    [deliveryId, status, error ? error.slice(0, 500) : null]
+    [deliveryId, status, error ? redactText(error).slice(0, 500) : null]
   );
 }
 

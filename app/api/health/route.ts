@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getPool } from "@/lib/db/client";
-import { getViewer } from "@/lib/auth/session";
+import { errorDetail, getViewer } from "@/lib/auth/session";
 import { countPendingDeliveries } from "@/lib/db/webhook-deliveries";
 
 export const runtime = "nodejs";
@@ -12,7 +12,7 @@ export const dynamic = "force-dynamic";
  * Public: { status, application, database } -- nothing else, no secrets, no
  * configuration details. 200 when healthy, 503 when the database is unreachable.
  *
- * Internal tooling (Bearer DEPLOYGUARD_STATUS_TOKEN) also gets operational
+ * Internal tooling (Bearer DEPLOYGUARD_INTERNAL_TOKEN) also gets operational
  * counters: deferred webhook work not yet processed, automatic analyses still
  * pending, and when installations were last reconciled.
  */
@@ -53,7 +53,7 @@ export async function GET() {
           lastReconciledAt: stats.rows[0].last_reconciled,
         };
       } catch (error) {
-        body.operations = { error: (error as Error).message };
+        body.operations = errorDetail(viewer, (error as Error).message);
       }
     }
   }

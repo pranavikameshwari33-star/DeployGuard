@@ -1,4 +1,6 @@
 import type { FileAnalysis } from "@/lib/analysis/change-analysis";
+import { redactDeep, redactNullable, redactText } from "@/lib/security/redact";
+import { safeGithubUrl } from "@/lib/security/untrusted";
 import {
   getDeploymentById,
   listDeployments,
@@ -131,12 +133,15 @@ export async function getDashboardData(
     }
   } else current = recent[0] ?? null;
 
-  return {
+  // Stage 1: one last redaction pass over everything the page will render
+  // (incident output, historical matches, assessment text), covering rows
+  // stored before redaction existed.
+  return redactDeep({
     selected: current ? await describe(current) : null,
     notFound: Boolean(options.deploymentId) && !current,
     history,
     incidents,
-  };
+  }).value;
 }
 
 async function describe(d: Deployment): Promise<SelectedDeployment> {
@@ -188,11 +193,14 @@ function toDashboardDeployment(d: Deployment): DashboardDeployment {
     created_at: d.created_at.toISOString(),
     status: d.status,
     ci_run_id: d.ci_run_id,
-    ci_run_url: d.ci_run_url,
+    // Stage 1: only an https://github.com link can become a link on the page.
+    ci_run_url: safeGithubUrl(d.ci_run_url),
     ci_started_at: d.ci_started_at?.toISOString() ?? null,
     ci_finished_at: d.ci_finished_at?.toISOString() ?? null,
     failure:
-      d.status === "FAILED" ? { stage: d.failure_stage, job: d.failure_job, message: d.failure_message } : null,
+      d.status === "FAILED"
+        ? { stage: redactNullable(d.failure_stage), job: redactNullable(d.failure_job), message: redactNullable(d.failure_message) }
+        : null,
     change_categories: d.change_categories,
     affected_services: d.affected_services,
     file_analysis: d.file_analysis,

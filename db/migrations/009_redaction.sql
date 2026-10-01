@@ -1,0 +1,13 @@
+-- Stage 1: security foundation. Additive only, re-runnable, like 001-008.
+--
+-- Records THAT redaction happened on a deployment's ingested text, never what
+-- was removed. Shape:
+--   { "commit_message": { "count": 1, "categories": ["github_token"] },
+--     "failure_output": { "count": 2, "categories": ["connection_string", "jwt"] } }
+-- NULL means nothing was redacted (or the row predates Stage 1).
+--
+-- Rollback / recovery: the column is not read by anything that predates
+-- Stage 1. To roll back, deploy the previous code; the column can stay. If it
+-- must go: ALTER TABLE deployments DROP COLUMN IF EXISTS redaction;
+-- (drops only the counts, no deployment data).
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS redaction JSONB;

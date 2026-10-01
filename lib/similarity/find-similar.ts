@@ -106,22 +106,18 @@ export async function findSimilarDeployments(
   // --- 1. Hindsight: which past deployments does memory associate with this change?
   const recalled = new Map<string, string[]>();
   let hindsight: SimilarityResult["hindsight"];
-  // Phase 9: an owned deployment recalls only memories tagged with its own
-  // immutable GitHub repository id; an unowned one keeps the name tag (as before).
-  const scopeTags = current.repository_id
-    ? current.github_repository_id
-      ? [`ghrepo:${current.github_repository_id}`]
-      : null
-    : [`repo:${repo}`];
+  // Phase 9 / Stage 1: recall is scoped to the deployment's own immutable GitHub
+  // repository id -- owned or not. The mutable repo:<name> tag is no longer a
+  // scope; without a repository id there is no recall (the client refuses it).
+  const scopeRepoIds = current.github_repository_id ? [current.github_repository_id] : null;
   if (options.useHindsight === false) {
     hindsight = { used: false, error: "disabled by request" };
-  } else if (!scopeTags) {
+  } else if (!scopeRepoIds) {
     hindsight = { used: false, error: "no repository scope available for memory recall" };
   } else {
     try {
       const { results } = await recall(buildRecallQuery(repo, current, currentAnalysis), {
-        tags: scopeTags,
-        tagsMatch: "any_strict",
+        githubRepositoryIds: scopeRepoIds,
       });
       for (const memory of results ?? []) {
         const id = memory.metadata?.deployment_id;

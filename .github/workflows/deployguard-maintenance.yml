@@ -6,9 +6,10 @@
 # App installations and repositories, recovers missed pushes, fixes pipelines
 # whose result never arrived, and resumes stuck risk analyses.
 #
-# Uses the same repository settings as deployguard-ci.yml:
+# Repository settings:
 #   Variables tab:  DEPLOYGUARD_URL
-#   Secrets tab:    DEPLOYGUARD_STATUS_TOKEN
+#   Secrets tab:    DEPLOYGUARD_INTERNAL_TOKEN  (Stage 1: NOT the CI status token; the
+#                   maintenance endpoint rejects DEPLOYGUARD_STATUS_TOKEN)
 # Without them the job only prints a warning.
 
 name: DeployGuard maintenance
@@ -28,16 +29,16 @@ jobs:
       - name: Run DeployGuard maintenance
         env:
           DEPLOYGUARD_URL: ${{ vars.DEPLOYGUARD_URL }}
-          DEPLOYGUARD_STATUS_TOKEN: ${{ secrets.DEPLOYGUARD_STATUS_TOKEN }}
+          DEPLOYGUARD_INTERNAL_TOKEN: ${{ secrets.DEPLOYGUARD_INTERNAL_TOKEN }}
         run: |
-          if [ -z "$DEPLOYGUARD_URL" ] || [ -z "$DEPLOYGUARD_STATUS_TOKEN" ]; then
-            echo "::warning title=DeployGuard::DEPLOYGUARD_URL or DEPLOYGUARD_STATUS_TOKEN is not configured; maintenance skipped."
+          if [ -z "$DEPLOYGUARD_URL" ] || [ -z "$DEPLOYGUARD_INTERNAL_TOKEN" ]; then
+            echo "::warning title=DeployGuard::DEPLOYGUARD_URL or DEPLOYGUARD_INTERNAL_TOKEN is not configured; maintenance skipped."
             exit 0
           fi
           # The token is sent only as a header; GitHub masks it in logs. The
           # response contains counts and ids only.
           status=$(curl -sS -o response.json -w "%{http_code}" -X POST \
-            -H "Authorization: Bearer ${DEPLOYGUARD_STATUS_TOKEN}" \
+            -H "Authorization: Bearer ${DEPLOYGUARD_INTERNAL_TOKEN}" \
             -H "ngrok-skip-browser-warning: 1" \
             --max-time 90 "${DEPLOYGUARD_URL%/}/api/maintenance/run" || echo "000")
           echo "HTTP ${status}"
