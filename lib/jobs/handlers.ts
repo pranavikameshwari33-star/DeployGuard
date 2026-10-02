@@ -9,6 +9,7 @@ import { buildIncidentMemory } from "@/lib/hindsight/incident-memory";
 import { processWorkflowRun } from "@/lib/github/app-events";
 import { reconcileInstallation } from "@/lib/github/installations";
 import { runRiskAnalysis } from "@/lib/risk/auto-risk";
+import { runReevaluation } from "@/lib/learning/confirm-incident";
 
 /**
  * Stage 2: what each job type does. Every handler is idempotent -- running it
@@ -71,6 +72,13 @@ export const handlers: Record<string, Handler> = {
       throw new RetryableJobError(`risk analysis temporarily unavailable (${outcome.kind})`);
     }
     return outcome.summary;
+  },
+
+  /** Stage 4.1: one bounded re-evaluation of the assessments that used a newly confirmed incident. */
+  [JOB_TYPES.learningReevaluate]: async (job) => {
+    const revision = Number(str(job, "revision"));
+    if (!Number.isInteger(revision) || revision < 1) throw new PermanentJobError("job payload has an invalid revision");
+    return runReevaluation(str(job, "incidentId"), revision);
   },
 
   /** Re-reads an installation and its repositories from GitHub (e.g. after unsuspend). */

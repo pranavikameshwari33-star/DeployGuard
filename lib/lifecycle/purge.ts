@@ -196,7 +196,7 @@ export async function purgeUser(userId: string): Promise<{ repositories: Record<
 /** The user's own records for one repository, in a portable JSON shape. Text is already redacted. */
 export async function exportRepository(githubRepositoryId: string) {
   const pool = getPool();
-  const [repo, deployments, incidents, assessments] = await Promise.all([
+  const [repo, deployments, incidents, assessments, confirmations, outcomes, reverts] = await Promise.all([
     pool.query(`SELECT github_repository_id::text, full_name, default_branch, private, connected, disconnected_at, created_at
                 FROM repositories WHERE github_repository_id = $1`, [githubRepositoryId]),
     pool.query(`SELECT id::text, owner, repository, branch, commit_sha, commit_message, author, changed_files, added_files,
@@ -205,13 +205,26 @@ export async function exportRepository(githubRepositoryId: string) {
                        risk_analysis_status, redaction
                 FROM deployments WHERE github_repository_id = $1 ORDER BY created_at`, [githubRepositoryId]),
     pool.query(`SELECT i.id::text, i.deployment_id::text, i.failure_type, i.failure_job, i.error_message, i.affected_service,
-                       i.downstream_effect, i.root_cause, i.resolution, i.created_at
+                       i.downstream_effect, i.root_cause, i.resolution, i.created_at, i.confirmed_revision,
+                       i.confirmed_by_login, i.confirmed_at, i.flake_status, i.flake_passing_run_url, i.error_signature
                 FROM incidents i JOIN deployments d ON d.id = i.deployment_id
                 WHERE d.github_repository_id = $1 ORDER BY i.created_at`, [githubRepositoryId]),
     pool.query(`SELECT a.id::text, a.deployment_id::text, a.risk_level, a.risk_confidence, a.risk_summary, a.risk_reasons,
                        a.historical_evidence, a.missing_information, a.recommended_checks, a.model, a.risk_generated_at
                 FROM risk_assessments a JOIN deployments d ON d.id = a.deployment_id
                 WHERE d.github_repository_id = $1 ORDER BY a.risk_generated_at`, [githubRepositoryId]),
+    // Stage 4: learning records.
+    pool.query(`SELECT c.incident_id::text, c.revision, c.root_cause, c.resolution, c.affected_service, c.downstream_effect,
+                       c.confirmed_by_login, c.confirmed_at
+                FROM incident_confirmations c JOIN incidents i ON i.id = c.incident_id JOIN deployments d ON d.id = i.deployment_id
+                WHERE d.github_repository_id = $1 ORDER BY c.incident_id, c.revision`, [githubRepositoryId]),
+    pool.query(`SELECT o.deployment_id::text, o.assessment_id::text, o.predicted_level, o.outcome_status, o.result,
+                       o.unscored_reason, o.rule_version, o.outcome_at
+                FROM risk_outcomes o JOIN deployments d ON d.id = o.deployment_id
+                WHERE d.github_repository_id = $1 ORDER BY o.outcome_at`, [githubRepositoryId]),
+    pool.query(`SELECT r.reverted_deployment_id::text, r.reverting_deployment_id::text, r.matched_by, r.hours_after, r.detected_at
+                FROM deployment_reverts r JOIN deployments d ON d.id = r.reverted_deployment_id
+                WHERE d.github_repository_id = $1 ORDER BY r.detected_at`, [githubRepositoryId]),
   ]);
   return {
     format: "deployguard-export/1",
@@ -220,6 +233,9 @@ export async function exportRepository(githubRepositoryId: string) {
     deployments: deployments.rows,
     incidents: incidents.rows,
     risk_assessments: assessments.rows,
+    incident_confirmations: confirmations.rows,
+    risk_outcomes: outcomes.rows,
+    deployment_reverts: reverts.rows,
     notes: [
       "Recalled Hindsight memories are not included: they are derived from these records.",
       "Ingested text (commit messages, CI output) was redacted before it was stored.",

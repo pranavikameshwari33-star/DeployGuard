@@ -15,8 +15,11 @@ substitute for a legal review (**MANUAL**: legal/privacy review not performed).
 | Table | Contents | Notes |
 | --- | --- | --- |
 | `deployments` | repository owner/name and immutable id, branch, commit SHA, **first commit message** (redacted), author login/name, changed file paths, change categories/services, pipeline status and timestamps, CI run id/URL, failed stage and job name, **failure output: the last 40 lines of the failing job log, redacted, ≤ 4000 chars** | failure output is cleared after `DEPLOYGUARD_RETENTION_FAILURE_OUTPUT_DAYS` (default 90) |
-| `incidents` | observed failure type, job, the same redacted output tail; root cause / resolution only if a person records them | |
-| `risk_assessments` | the validated assessment, and the exact evidence bundle that was sent to Gemini | |
+| `incidents` | observed failure type, job, the same redacted output tail, failing run id/URL, a normalised error signature, probable-flake marker with the passing run; root cause / resolution / service / downstream effect only if a person confirms them (Stage 4) | |
+| `incident_confirmations` | Stage 4: every revision of a human confirmation (redacted text, GitHub login of the person, time) | append-only (database trigger) |
+| `risk_assessments` | the validated assessment, and the exact evidence bundle that was sent to Gemini | the prediction cannot be edited (database trigger); only text redaction may change a row |
+| `risk_outcomes` | Stage 4: per finished deployment, the pre-CI prediction compared with the outcome (hit / miss / false alarm / unscored) | append-only (database trigger) |
+| `deployment_reverts` | Stage 4: which deployment reverted which, how it was recognised, hours between | |
 | `users`, `sessions` | GitHub user id, login, display name, avatar URL; a SHA-256 hash of the session token | |
 | `github_installations`, `repositories` | installation/account ids and logins, repository names, private flag, connection state | |
 | `github_webhook_deliveries` | delivery GUID, event, action, ids, outcome, a redacted error; the (redacted) payload only until a queued `workflow_run` is processed | pruned after 14/30 days |
@@ -52,7 +55,8 @@ Recalled memory text is never sent. Calls are capped per repository
 * **Purge a repository** — `POST /api/repositories/purge` (owner, same-origin, confirmation
   = full repository name): deletes every Hindsight document of the repository and verifies
   each is gone, then deletes its deployments, incidents, assessments, queued jobs and
-  delivery-log rows in one transaction, then verifies PostgreSQL and that a scoped recall
+  delivery-log rows in one transaction (Stage 4 confirmations, outcomes and reverts go with
+  their deployments by cascade), then verifies PostgreSQL and that a scoped recall
   returns nothing. If Hindsight deletion fails, PostgreSQL is left untouched so the purge
   can simply be repeated. Kept after a purge: the repository's connection row (so
   monitoring state is clear), its `gemini_usage` counts and its audit-log entries.
@@ -60,7 +64,8 @@ Recalled memory text is never sent. Calls are capped per repository
   repository as above, then deletes repository rows, installation links, sessions and the
   user row. The GitHub App stays installed on GitHub until the user uninstalls it there.
 * **Export** — `GET /api/repositories/export?githubRepositoryId=…`: the owner's deployments,
-  incidents and risk assessments for one repository as JSON.
+  incidents, risk assessments and (Stage 4) confirmation revisions, prediction outcomes and
+  reverts for one repository as JSON.
 All three are audit-logged.
 
 ## Known limitations

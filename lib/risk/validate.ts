@@ -25,13 +25,27 @@ export type ReasonBasis = (typeof REASON_BASES)[number];
 // ---------------------------------------------------------------------------
 
 export type EvidenceFailure = { stage: string | null; job: string | null; message: string | null };
+/** Stage 4.1: where root_cause / resolution / service / effect come from. */
+export type IncidentProvenance = "HUMAN-CONFIRMED" | "NOT DETERMINED";
+
 export type EvidenceIncident = {
   id: string;
   failure_type: string;
   error_message: string | null;
   root_cause: string | null;
   resolution: string | null;
+  /** Stage 4 fields (absent in bundles stored before Stage 4). */
+  affected_service?: string | null;
+  downstream_effect?: string | null;
+  /** HUMAN-CONFIRMED only when a person recorded the fields above (attributed, with history). */
+  provenance?: IncidentProvenance;
+  confirmed_at?: string | null;
+  /** Stage 4.4: a re-run of the same commit passed. */
+  probable_flake?: boolean;
 };
+
+/** Stage 4.5: a revert observed by DeployGuard (database fact). */
+export type EvidenceRevert = { deployment_id: string; hours_after: number };
 
 export type EvidenceMatch = {
   deployment_id: string;
@@ -47,6 +61,8 @@ export type EvidenceMatch = {
   similarity_score: number;
   relevance: string;
   matched_signals: string[];
+  /** Stage 4.5: this past deployment was reverted by a later one. */
+  reverted_by?: EvidenceRevert | null;
 };
 
 export type RiskEvidence = {
@@ -62,6 +78,9 @@ export type RiskEvidence = {
     added_files: string[];
     modified_files: string[];
     deleted_files: string[];
+    /** Stage 4.5: this deployment reverts an earlier one / was itself reverted. */
+    reverts?: EvidenceRevert | null;
+    reverted_by?: EvidenceRevert | null;
   };
   change_analysis: {
     change_categories: string[];
@@ -273,6 +292,9 @@ export function validateRiskAssessment(raw: unknown, evidence: RiskEvidence): Va
     ...supplied.keys(),
     ...evidence.historical_evidence.matches.flatMap((m) => (m.incident ? [m.incident.id] : [])),
     ...(evidence.current_pipeline.incident ? [evidence.current_pipeline.incident.id] : []),
+    // Stage 4.5: deployments named by observed revert facts.
+    ...[evidence.current_deployment.reverts, evidence.current_deployment.reverted_by, ...evidence.historical_evidence.matches.map((m) => m.reverted_by)]
+      .flatMap((r) => (r ? [r.deployment_id] : [])),
   ]);
 
   // --- lists ---------------------------------------------------------------------
@@ -381,9 +403,11 @@ export function checkUntrustedProse(prose: string, evidence: RiskEvidence): stri
     evidence.current_pipeline.incident,
     ...evidence.historical_evidence.matches.map((m) => m.incident),
   ].filter((i): i is EvidenceIncident => i !== null);
+  // Stage 4.1: a cause or fix is attested only by a HUMAN-CONFIRMED record.
+  const confirmed = incidents.filter((i) => i.provenance === "HUMAN-CONFIRMED");
   const attested = {
-    root_cause: incidents.some((i) => Boolean(i.root_cause)),
-    resolution: incidents.some((i) => Boolean(i.resolution)),
+    root_cause: confirmed.some((i) => Boolean(i.root_cause)),
+    resolution: confirmed.some((i) => Boolean(i.resolution)),
   };
   for (const sentence of prose.split(/(?<=[.!?])\s+|\n+/)) {
     if (HEDGE_OR_UNKNOWN.test(sentence)) continue;

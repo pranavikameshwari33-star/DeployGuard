@@ -66,6 +66,10 @@ export const env = {
   retentionFailureOutputDays: () => intOption("DEPLOYGUARD_RETENTION_FAILURE_OUTPUT_DAYS", 90),
   /** Days to keep deployments at all (with incidents, assessments, memories); 0 = keep forever. */
   retentionDeploymentDays: () => intOption("DEPLOYGUARD_RETENTION_DEPLOYMENT_DAYS", 0),
+
+  // --- Stage 4: learning (optional, with defaults) ---
+  /** Hours after a deployment in which a revert commit is attached to it; 0 = revert detection off. */
+  revertWindowHours: () => intOption("DEPLOYGUARD_REVERT_WINDOW_HOURS", 72),
 };
 
 function intOption(name: string, fallback: number): number {

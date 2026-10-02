@@ -1,5 +1,7 @@
 import { analyzeChanges } from "@/lib/analysis/change-analysis";
 import { insertDeployment, type Deployment } from "@/lib/db/deployments";
+import { detectRevert } from "@/lib/db/learning";
+import { env } from "@/lib/env";
 import type { PushEvent } from "@/lib/github/parse-push-event";
 import { enqueue } from "@/lib/jobs/queue";
 import { JOB_TYPES } from "@/lib/jobs/types";
@@ -82,6 +84,19 @@ export async function ingestPush(
     return { deployment, isNew, riskScheduled: false };
   }
   console.log(`[DeployGuard][db] Stored deployment #${deployment.id} with status ${deployment.status} (${options.source}).`);
+
+  // Stage 4.5: is this push a revert of a recent deployment? (observed signal, best effort)
+  try {
+    const revert = await detectRevert(deployment, env.revertWindowHours());
+    if (revert) {
+      console.log(
+        `[DeployGuard][learning] Deployment #${deployment.id} reverts deployment #${revert.reverted_deployment_id} ` +
+          `(${revert.matched_by}, ${revert.hours_after}h later).`
+      );
+    }
+  } catch (error) {
+    console.error(`[DeployGuard][learning] Revert check failed for deployment #${deployment.id}: ${(error as Error).message}`);
+  }
 
   // Agent memory (Stage 2: a queued job with retries, never inside the request).
   let memory: { queued: boolean; jobId?: string };

@@ -4,11 +4,15 @@ import { getIncidentDetail, listRepositoryOptions, type RepositoryOption } from 
 import { recallForDeployment, type RecalledMemory as RecalledMemoryData } from "@/lib/dashboard/recalled";
 import { getDeploymentById } from "@/lib/db/deployments";
 import { getViewer, scopeOf } from "@/lib/auth/session";
+import { askHistory, type AskResult } from "@/lib/learning/ask-history";
 import { AutoRefresh } from "./_components/auto-refresh";
 import { absoluteTime } from "./_components/format";
 import { makeLinks } from "./_components/links";
 import {
+  AccuracyRecordPanel,
+  AskHistory,
   ChangeAnalysis,
+  FailurePatterns,
   ConnectedRepositories,
   CurrentDeployment,
   DeploymentHistory,
@@ -47,6 +51,7 @@ const isId = (v: unknown): v is string => typeof v === "string" && /^\d{1,19}$/.
  *   ?id=<deployment id>            show a specific deployment
  *   ?incident=<incident id>        incident detail
  *   ?offset=<n>                    history paging
+ *   ?ask=<question>                Stage 4.6: ask your history (explicit; the only page load that asks Hindsight besides ?memory=1)
  */
 export default async function Dashboard({
   searchParams,
@@ -89,6 +94,19 @@ export default async function Dashboard({
     if (raw) memory = await recallForDeployment(raw, user ? `user:${user.user.id}` : "internal");
   }
 
+  // Stage 4.6: answered only when the user submitted a question. Scope = the
+  // viewer's repositories (narrowed by the switcher), in SQL and in Hindsight.
+  let ask: AskResult | null = null;
+  if (typeof params.ask === "string" && hasRepositories && !incidentId) {
+    const githubRepositoryIds = repo ? [repo] : options.map((o) => o.github_repository_id);
+    ask = await askHistory({
+      question: params.ask,
+      scope: { scope, githubRepositoryId: repo },
+      githubRepositoryIds,
+      actorKey: user ? `user:${user.user.id}` : "internal",
+    });
+  }
+
   const currentRepository =
     user && selected ? user.repositories.find((r) => String(r.github_repository_id) === selected.deployment.github_repository_id) ?? null : null;
   const allDisconnected = user ? user.repositories.length > 0 && user.repositories.every((r) => r.connection_state !== "CONNECTED") : false;
@@ -110,6 +128,8 @@ export default async function Dashboard({
             <a href={`${links.home()}#overview`}>Overview</a>
             <a href={`${links.home()}#deployments`}>Deployments</a>
             <a href={`${links.home()}#incidents`}>Incidents</a>
+            <a href={`${links.home()}#ask`}>Ask</a>
+            <a href={`${links.home()}#patterns`}>Learning</a>
             {user ? <a href={`${links.home()}#repositories`}>Connections</a> : null}
           </nav>
           <span className="topbar-meta">
@@ -160,7 +180,7 @@ export default async function Dashboard({
           </section>
         ) : incidentId ? (
           incident ? (
-            <IncidentDetail data={incident} links={links} />
+            <IncidentDetail data={incident} links={links} canConfirm={Boolean(user)} />
           ) : (
             <section className="panel">
               <div className="empty">
@@ -198,7 +218,7 @@ export default async function Dashboard({
                 <ChangeAnalysis d={selected.deployment} />
               </div>
               <div className="stack">
-                <PipelinePanel d={selected.deployment} incident={selected.incident} links={links} />
+                <PipelinePanel d={selected.deployment} incident={selected.incident} reverts={selected.reverts} links={links} />
                 {user ? <ConnectedRepositories repositories={user.repositories} links={links} /> : null}
               </div>
             </div>
@@ -222,6 +242,11 @@ export default async function Dashboard({
           <DeploymentHistory rows={data.history} selectedId={selected?.deployment.id ?? null} counts={data.counts} page={data.page} links={links} />
         ) : null}
         {data && data.history.length ? <IncidentHistory rows={data.incidents} links={links} /> : null}
+        {data && hasRepositories ? <AskHistory result={ask} repo={repo} links={links} /> : null}
+        {data && data.history.length ? (
+          <FailurePatterns patterns={data.learning.patterns} windowDays={data.learning.windowDays} links={links} />
+        ) : null}
+        {data && data.history.length ? <AccuracyRecordPanel record={data.learning.accuracy} links={links} /> : null}
       </main>
     </>
   );

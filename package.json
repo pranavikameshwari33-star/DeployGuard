@@ -26,7 +26,9 @@
     "verify:queue": "node --experimental-strip-types --no-warnings --import ./scripts/ts-alias.mjs scripts/verify-queue.mjs",
     "verify:lifecycle": "node --experimental-strip-types --no-warnings --import ./scripts/ts-alias.mjs scripts/verify-lifecycle.mjs",
     "verify:migrations": "node scripts/verify-migrations.mjs",
-    "verify:dashboard": "node --experimental-strip-types --no-warnings --import ./scripts/ts-alias.mjs scripts/verify-dashboard.mjs"
+    "verify:dashboard": "node --experimental-strip-types --no-warnings --import ./scripts/ts-alias.mjs scripts/verify-dashboard.mjs",
+    "eval:risk": "node --experimental-strip-types --no-warnings --import ./scripts/ts-alias.mjs scripts/evaluate-risk.mjs",
+    "verify:learning": "node --experimental-strip-types --no-warnings --import ./scripts/ts-alias.mjs scripts/verify-learning.mjs"
   },
   "dependencies": {
     "next": "16.3.6",

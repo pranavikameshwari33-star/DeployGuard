@@ -59,6 +59,9 @@ Evidence rules (mandatory):
 - Never invent deployments, incidents, root causes, resolutions, affected services, downstream effects or outcomes.
 - Cite past deployments only by the deployment_id values in historical_evidence.matches, and state their outcome exactly as recorded in "status".
 - A null root_cause or resolution means it is NOT KNOWN. Say it is unknown; do not guess it. A timeout, for example, is an observed failure, not a root cause.
+- Only an incident with provenance "HUMAN-CONFIRMED" has a known root cause or resolution; when you use it, say it was confirmed by a person.
+- An incident with probable_flake = true failed and then passed on a re-run of the same commit: weigh it as weak evidence about the change.
+- reverted_by / reverts are observed revert commits; a revert shows that someone undid the deployment soon after; it does not say why.
 - similarity_score is a ranking heuristic, not a probability.
 - If the pipeline state is pending or running, there are NO test or build results yet. Do not claim tests passed or failed.
 - Weigh ALL matching history: successes are evidence too. Mixed outcomes must be described as mixed.

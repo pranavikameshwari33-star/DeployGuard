@@ -293,6 +293,14 @@ export type HistoricalDeployment = Deployment & {
   incident_error_message: string | null;
   incident_root_cause: string | null;
   incident_resolution: string | null;
+  /** Stage 4: confirmation, flake and revert facts. */
+  incident_affected_service: string | null;
+  incident_downstream_effect: string | null;
+  incident_confirmed_revision: number | null;
+  incident_confirmed_at: Date | null;
+  incident_flake_status: string | null;
+  reverted_by_deployment_id: string | null;
+  reverted_hours_after: string | null;
 };
 
 /**
@@ -316,9 +324,21 @@ export async function findHistoryCandidates(
             i.failure_type  AS incident_failure_type,
             i.error_message AS incident_error_message,
             i.root_cause    AS incident_root_cause,
-            i.resolution    AS incident_resolution
+            i.resolution    AS incident_resolution,
+            i.affected_service   AS incident_affected_service,
+            i.downstream_effect  AS incident_downstream_effect,
+            i.confirmed_revision AS incident_confirmed_revision,
+            i.confirmed_at       AS incident_confirmed_at,
+            i.flake_status       AS incident_flake_status,
+            rv.reverting_deployment_id::text AS reverted_by_deployment_id,
+            rv.hours_after::text AS reverted_hours_after
      FROM deployments d
      LEFT JOIN incidents i ON i.deployment_id = d.id
+     -- Stage 4.5: the first observed revert of this deployment, if any.
+     LEFT JOIN LATERAL (
+       SELECT r.reverting_deployment_id, r.hours_after FROM deployment_reverts r
+       WHERE r.reverted_deployment_id = d.id ORDER BY r.detected_at LIMIT 1
+     ) rv ON true
      WHERE d.owner = $1 AND d.repository = $2
        -- Phase 9: history never crosses an ownership boundary. An owned
        -- deployment only sees deployments of the SAME connected repository;

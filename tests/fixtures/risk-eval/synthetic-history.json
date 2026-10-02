@@ -1,0 +1,152 @@
+{
+  "format": "deployguard-eval/1",
+  "description": "SYNTHETIC fixture. The histories and the recorded model outputs were written by hand to exercise the evaluation harness (replay, similarity, validator, scoring). They are NOT real Gemini answers and say nothing about how useful DeployGuard's risk analysis is. Usefulness must be measured on real exported histories (--export).",
+  "repositories": [
+    {
+      "name": "acme/shop",
+      "deployments": [
+        {
+          "id": "1", "commit_message": "Add order listing endpoint", "outcome": "SUCCESS",
+          "files": { "added": ["src/api/orders.ts"], "modified": [], "deleted": [] },
+          "model_output": {
+            "risk_level": "LOW", "confidence": 0.5, "summary": "No similar history exists for this change.",
+            "historical_evidence_available": false,
+            "reasons": [{ "reason": "Adds one API file.", "basis": "current_change", "evidence_deployment_ids": [] }],
+            "historical_evidence": [], "missing_information": ["No earlier deployments to compare with."],
+            "recommended_checks": ["Run the API tests."]
+          }
+        },
+        {
+          "id": "2", "commit_message": "Tune database pool size", "outcome": "FAILED",
+          "failure": { "stage": "test", "message": "Error: connect ETIMEDOUT 10.0.0.7:5432" },
+          "files": { "added": [], "modified": ["src/db/pool.ts", "config/database.yaml"], "deleted": [] },
+          "model_output": {
+            "risk_level": "MEDIUM", "confidence": 0.4, "summary": "Database configuration changes with no similar history.",
+            "historical_evidence_available": false,
+            "reasons": [{ "reason": "Changes database configuration.", "basis": "current_change", "evidence_deployment_ids": [] }],
+            "historical_evidence": [], "missing_information": ["No earlier database changes recorded."],
+            "recommended_checks": ["Run the database integration tests."]
+          }
+        },
+        {
+          "id": "3", "commit_message": "Raise pool timeout", "outcome": "FAILED",
+          "failure": { "stage": "test", "message": "Error: connect ETIMEDOUT 10.0.0.9:5432" },
+          "files": { "added": [], "modified": ["src/db/pool.ts"], "deleted": [] },
+          "model_output": {
+            "risk_level": "HIGH", "confidence": 0.7, "summary": "Deployment #2 changed src/db/pool.ts and FAILED with a connection timeout.",
+            "historical_evidence_available": true,
+            "reasons": [{ "reason": "Deployment #2 changed the same file and FAILED.", "basis": "historical_evidence", "evidence_deployment_ids": ["2"] }],
+            "historical_evidence": [{ "deployment_id": "2", "outcome": "FAILED", "relevance_note": "Same file." }],
+            "missing_information": ["The root cause of the earlier failure is not known."],
+            "recommended_checks": ["Run the database integration tests against staging."]
+          }
+        },
+        {
+          "id": "4", "commit_message": "Fix pool host configuration", "outcome": "SUCCESS",
+          "files": { "added": [], "modified": ["src/db/pool.ts", "config/database.yaml"], "deleted": [] },
+          "model_output": {
+            "risk_level": "HIGH", "confidence": 0.8, "summary": "Deployments #2 and #3 changed these files and both FAILED.",
+            "historical_evidence_available": true,
+            "reasons": [{ "reason": "Two earlier changes to the pool failed.", "basis": "historical_evidence", "evidence_deployment_ids": ["2", "3"] }],
+            "historical_evidence": [
+              { "deployment_id": "2", "outcome": "FAILED", "relevance_note": "Same files." },
+              { "deployment_id": "3", "outcome": "FAILED", "relevance_note": "Same file." }
+            ],
+            "missing_information": ["Whether the earlier timeouts were fixed."],
+            "recommended_checks": ["Run the database integration tests."]
+          }
+        },
+        {
+          "id": "5", "commit_message": "Update README", "outcome": "SUCCESS",
+          "files": { "added": [], "modified": ["README.md"], "deleted": [] },
+          "model_output": {
+            "risk_level": "LOW", "confidence": 0.6, "summary": "Documentation-only change with no similar history.",
+            "historical_evidence_available": false,
+            "reasons": [{ "reason": "Only README.md changed.", "basis": "current_change", "evidence_deployment_ids": [] }],
+            "historical_evidence": [], "missing_information": [],
+            "recommended_checks": ["Preview the rendered README."]
+          }
+        },
+        {
+          "id": "6", "commit_message": "Pool retries", "outcome": "FAILED",
+          "failure": { "stage": "test", "message": "Error: connect ETIMEDOUT 10.0.0.7:5432" },
+          "files": { "added": [], "modified": ["src/db/pool.ts"], "deleted": [] },
+          "model_output": {
+            "risk_level": "LOW", "confidence": 0.6, "summary": "Deployment #4 changed src/db/pool.ts and SUCCEEDED, so this looks safe.",
+            "historical_evidence_available": true,
+            "reasons": [{ "reason": "The last change to this file succeeded.", "basis": "historical_evidence", "evidence_deployment_ids": ["4"] }],
+            "historical_evidence": [{ "deployment_id": "4", "outcome": "SUCCESS", "relevance_note": "Same file." }],
+            "missing_information": [],
+            "recommended_checks": ["Run the unit tests."]
+          }
+        },
+        {
+          "id": "7", "commit_message": "Pool metrics", "outcome": "SUCCESS",
+          "files": { "added": ["src/db/metrics.ts"], "modified": ["src/db/pool.ts"], "deleted": [] },
+          "model_output": {
+            "risk_level": "HIGH", "confidence": 0.7, "summary": "The root cause was an exhausted connection pool, seen in deployment #6.",
+            "historical_evidence_available": true,
+            "reasons": [{ "reason": "Deployment #6 failed on the same file.", "basis": "historical_evidence", "evidence_deployment_ids": ["6"] }],
+            "historical_evidence": [{ "deployment_id": "6", "outcome": "FAILED", "relevance_note": "Same file." }],
+            "missing_information": [],
+            "recommended_checks": ["Load-test the pool."]
+          }
+        }
+      ]
+    },
+    {
+      "name": "acme/payments",
+      "deployments": [
+        {
+          "id": "21", "commit_message": "Add refund handler", "outcome": "SUCCESS",
+          "files": { "added": ["services/payment-service/src/refund.ts"], "modified": [], "deleted": [] },
+          "model_output": {
+            "risk_level": "MEDIUM", "confidence": 0.5, "summary": "Payment code changes with no similar history.",
+            "historical_evidence_available": false,
+            "reasons": [{ "reason": "Touches payment-service.", "basis": "current_change", "evidence_deployment_ids": [] }],
+            "historical_evidence": [], "missing_information": ["No earlier payment changes."],
+            "recommended_checks": ["Run the payment tests."]
+          }
+        },
+        {
+          "id": "22", "commit_message": "Refund currency rounding", "outcome": "FAILED",
+          "failure": { "stage": "test", "message": "FAIL services/payment-service/test/refund.test.ts\nExpected 10.00, received 9.99" },
+          "files": { "added": [], "modified": ["services/payment-service/src/refund.ts"], "deleted": [] },
+          "model_output": {
+            "risk_level": "LOW", "confidence": 0.6, "summary": "Deployment #21 changed this file and SUCCEEDED.",
+            "historical_evidence_available": true,
+            "reasons": [{ "reason": "The previous refund change passed.", "basis": "historical_evidence", "evidence_deployment_ids": ["21"] }],
+            "historical_evidence": [{ "deployment_id": "21", "outcome": "SUCCESS", "relevance_note": "Same file." }],
+            "missing_information": [],
+            "recommended_checks": ["Run the refund tests."]
+          }
+        },
+        {
+          "id": "23", "commit_message": "Refund webhook", "outcome": "SUCCESS",
+          "files": { "added": ["services/payment-service/src/webhook.ts"], "modified": ["services/payment-service/src/refund.ts"], "deleted": [] },
+          "model_output": {
+            "risk_level": "HIGH", "confidence": 0.6, "summary": "Deployment #22 failed after changing refund.ts; see https://status.example.com for details.",
+            "historical_evidence_available": true,
+            "reasons": [{ "reason": "Deployment #22 failed on this file.", "basis": "historical_evidence", "evidence_deployment_ids": ["22"] }],
+            "historical_evidence": [{ "deployment_id": "22", "outcome": "FAILED", "relevance_note": "Same file." }],
+            "missing_information": [],
+            "recommended_checks": ["Run the refund tests."]
+          }
+        },
+        {
+          "id": "24", "commit_message": "Payment provider timeout", "outcome": "FAILED",
+          "failure": { "stage": "deploy", "message": "Error: provider request timed out after 30000ms" },
+          "files": { "added": [], "modified": ["services/payment-service/src/provider.ts", "services/payment-service/config/provider.yaml"], "deleted": [] },
+          "model_output": {
+            "risk_level": "HIGH", "confidence": 0.5, "summary": "Payment configuration change; deployment #99 failed the same way.",
+            "historical_evidence_available": true,
+            "reasons": [{ "reason": "Deployment #99 failed.", "basis": "historical_evidence", "evidence_deployment_ids": ["99"] }],
+            "historical_evidence": [{ "deployment_id": "99", "outcome": "FAILED", "relevance_note": "Similar." }],
+            "missing_information": [],
+            "recommended_checks": ["Check the provider timeout setting."]
+          }
+        }
+      ]
+    }
+  ]
+}

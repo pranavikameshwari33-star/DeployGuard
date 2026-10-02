@@ -29,6 +29,9 @@ export const RATE_LIMITS = {
   riskAnalyze: { limit: 30, windowSeconds: 60 * 60 },   // POST /api/deployments/risk by a user (may call Gemini)
   purge: { limit: 5, windowSeconds: 60 * 60 },          // Stage 2: repository / account purge, per user
   export: { limit: 20, windowSeconds: 60 * 60 },        // Stage 2: data export, per user
+  // Stage 4: learning features.
+  incidentConfirm: { limit: 30, windowSeconds: 60 * 60 }, // POST /api/incidents/confirmation, per user
+  askHistory: { limit: 30, windowSeconds: 10 * 60 },      // ask-your-history (Hindsight call), per user
 } satisfies Record<string, RateLimitRule>;
 
 /**

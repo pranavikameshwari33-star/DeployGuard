@@ -51,9 +51,18 @@ export type HistoricalEvidence = {
     id: string;
     failure_type: string;
     error_message: string | null;
+    /** NULL = not known. Non-null only when HUMAN-CONFIRMED (Stage 4.1). */
     root_cause: string | null;
     resolution: string | null;
+    affected_service: string | null;
+    downstream_effect: string | null;
+    provenance: "HUMAN-CONFIRMED" | "NOT DETERMINED";
+    confirmed_at: string | null;
+    /** Stage 4.4: a re-run of the same commit passed. */
+    probable_flake: boolean;
   } | null;
+  /** Stage 4.5: observed revert of this deployment by a later one. */
+  reverted_by: { deployment_id: string; hours_after: number } | null;
   similarity_score: number;
   relevance: "strong" | "weak";
   matched_signals: MatchedSignal[];
@@ -149,9 +158,12 @@ export async function findSimilarDeployments(
     if (row.id === current.id || byId.has(row.id)) continue;
     const analysis = analysisOf(row);
     const wasRecalled = recalled.has(row.id);
+    // Stage 4.4: a probable flake's failure type is noise, so it earns no
+    // same_failure_type points (the deployment itself still matches on its files).
+    const flaky = row.incident_flake_status === "probable_flake";
     const { score, relevance, signals } = scoreSimilarity(
       currentComparable,
-      comparable(row, analysis, row.incident_failure_type),
+      comparable(row, analysis, flaky ? null : row.incident_failure_type),
       { recalledByHindsight: wasRecalled, minScore }
     );
     if (relevance === "not_relevant") continue;
@@ -176,9 +188,17 @@ export async function findSimilarDeployments(
             id: row.incident_id,
             failure_type: row.incident_failure_type ?? "unknown_failure",
             error_message: tail(row.incident_error_message),
-            root_cause: row.incident_root_cause,
-            resolution: row.incident_resolution,
+            root_cause: confirmed(row) ? row.incident_root_cause : null,
+            resolution: confirmed(row) ? row.incident_resolution : null,
+            affected_service: confirmed(row) ? row.incident_affected_service : null,
+            downstream_effect: confirmed(row) ? row.incident_downstream_effect : null,
+            provenance: confirmed(row) ? "HUMAN-CONFIRMED" : "NOT DETERMINED",
+            confirmed_at: confirmed(row) ? row.incident_confirmed_at?.toISOString() ?? null : null,
+            probable_flake: flaky,
           }
+        : null,
+      reverted_by: row.reverted_by_deployment_id
+        ? { deployment_id: row.reverted_by_deployment_id, hours_after: Number(row.reverted_hours_after) }
         : null,
       similarity_score: score,
       relevance,
@@ -246,6 +266,11 @@ function buildRecallQuery(repo: string, d: Deployment, analysis: ChangeAnalysis)
     `in categories ${analysis.categories.join(", ") || "none"}, affecting ${services}. ` +
     `What happened to them, did they fail, and what failure was observed?`
   );
+}
+
+/** Stage 4.1: the cause fields count only when a person confirmed them. */
+function confirmed(row: { incident_confirmed_revision: number | null }): boolean {
+  return row.incident_confirmed_revision !== null;
 }
 
 /** Keep the end of long output: that is where a failing command reports its error. */

@@ -18,6 +18,16 @@ import {
 import { toEvidenceMatch } from "@/lib/risk/evidence";
 import type { EvidenceMatch, RiskLevel } from "@/lib/risk/validate";
 import { findSimilarDeployments } from "@/lib/similarity/find-similar";
+import {
+  findFailurePatterns,
+  flakyDeploymentIds,
+  getAccuracyRecord,
+  getRevertFacts,
+  revertedDeploymentIds,
+  type AccuracyRecord,
+  type FailurePattern,
+  type RevertFacts,
+} from "@/lib/db/learning";
 
 /**
  * Phase 8: everything the dashboard shows, read in one place.
@@ -85,6 +95,8 @@ export type SelectedDeployment = {
    */
   reanalyze: { offered: boolean; why: string };
   incident: Incident | null;
+  /** Stage 4.5: observed reverts of / by this deployment. */
+  reverts: RevertFacts;
   evidence: {
     /** "assessment": exactly what the risk analysis saw. "database": current structured matches (no analysis yet). */
     source: "assessment" | "database";
@@ -104,6 +116,9 @@ export type HistoryRow = {
   risk_level: RiskLevel | null;
   risk_analysis_status: RiskAnalysisStatus | null;
   created_at: string;
+  /** Stage 4: the failure was a probable flake / the deployment was reverted. */
+  probable_flake: boolean;
+  reverted: boolean;
 };
 
 export type DashboardData = {
@@ -116,7 +131,12 @@ export type DashboardData = {
   counts: HistoryCounts;
   /** Stage 3: history paging. */
   page: { offset: number; limit: number; hasMore: boolean };
+  /** Stage 4: what DeployGuard has learned in this scope (PostgreSQL only). */
+  learning: { patterns: FailurePattern[]; accuracy: AccuracyRecord; windowDays: number };
 };
+
+/** Stage 4.3: recurring failure patterns are looked for in this many days. */
+export const PATTERN_WINDOW_DAYS = 60;
 
 export async function getDashboardData(
   options: {
@@ -135,14 +155,17 @@ export async function getDashboardData(
   const limit = options.historyLimit ?? 25;
   const offset = Math.max(0, options.historyOffset ?? 0);
   // One extra row tells whether there is an older page.
-  const [page, incidents, counts, latest] = await Promise.all([
+  const [page, incidents, counts, latest, patterns, accuracy] = await Promise.all([
     listDeploymentsPage(view, limit + 1, offset),
     listIncidentsScoped(view, 20),
     historyCounts(view),
     offset > 0 && !options.deploymentId ? listDeploymentsPage(view, 1, 0) : Promise.resolve(null),
+    findFailurePatterns(view, { windowDays: PATTERN_WINDOW_DAYS }),
+    getAccuracyRecord(view),
   ]);
   const recent = page.slice(0, limit);
-  const levels = await getLatestRiskLevels(recent.map((d) => d.id));
+  const ids = recent.map((d) => d.id);
+  const [levels, flaky, reverted] = await Promise.all([getLatestRiskLevels(ids), flakyDeploymentIds(ids), revertedDeploymentIds(ids)]);
 
   const history: HistoryRow[] = recent.map((d) => ({
     id: d.id,
@@ -156,6 +179,8 @@ export async function getDashboardData(
     risk_level: levels.get(d.id) ?? null,
     risk_analysis_status: d.risk_analysis_status,
     created_at: d.created_at.toISOString(),
+    probable_flake: flaky.has(d.id),
+    reverted: reverted.has(d.id),
   }));
 
   let current: Deployment | null = null;
@@ -177,13 +202,16 @@ export async function getDashboardData(
     incidents,
     counts,
     page: { offset, limit, hasMore: page.length > limit },
+    learning: { patterns, accuracy, windowDays: PATTERN_WINDOW_DAYS },
   }).value;
 }
 
 async function describe(d: Deployment): Promise<SelectedDeployment> {
-  const [assessment, incident] = await Promise.all([
+  // Stage 4.4: a deployment that passed on a re-run keeps its incident (probable flake), so load it for any status.
+  const [assessment, incident, reverts] = await Promise.all([
     getLatestAssessment(d.id),
-    d.status === "FAILED" ? getIncidentForDeployment(d.id) : Promise.resolve(null),
+    getIncidentForDeployment(d.id),
+    getRevertFacts(d.id),
   ]);
 
   // Historical evidence: exactly what the risk analysis saw, when there is one.
@@ -197,7 +225,7 @@ async function describe(d: Deployment): Promise<SelectedDeployment> {
   }
 
   const risk = riskView(d, assessment);
-  return { deployment: toDashboardDeployment(d), risk, incident, evidence, reanalyze: reanalyzeOffer(d, risk) };
+  return { deployment: toDashboardDeployment(d), risk, incident, reverts, evidence, reanalyze: reanalyzeOffer(d, risk) };
 }
 
 function reanalyzeOffer(d: Deployment, risk: RiskView): SelectedDeployment["reanalyze"] {

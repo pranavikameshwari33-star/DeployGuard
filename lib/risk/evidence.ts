@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { getDeploymentById, type Deployment } from "@/lib/db/deployments";
 import { getIncidentForDeployment, type Incident } from "@/lib/db/incidents";
+import { getRevertFacts } from "@/lib/db/learning";
 import { findSimilarDeployments, type HistoricalEvidence } from "@/lib/similarity/find-similar";
 import type { EvidenceFailure, EvidenceIncident, EvidenceMatch, RiskEvidence } from "@/lib/risk/validate";
 import { redactDeep } from "@/lib/security/redact";
@@ -20,7 +21,8 @@ import { MODEL_FIELD_LIMITS as L, sanitizeForModel, sanitizeNullable } from "@/l
 
 /** Bump when the prompt or bundle shape changes, so cached assessments are regenerated. */
 // risk-v3 (Stage 1): untrusted fields sanitised, instructions state that field contents are data.
-export const RISK_PROMPT_VERSION = "risk-v3";
+// risk-v4 (Stage 4): incident provenance (HUMAN-CONFIRMED / NOT DETERMINED), probable flakes, reverts.
+export const RISK_PROMPT_VERSION = "risk-v4";
 
 const MAX_TEXT = 1000;
 
@@ -35,9 +37,10 @@ export async function buildRiskEvidence(deploymentId: string): Promise<RiskEvide
   const deployment = await getDeploymentById(deploymentId);
   if (!deployment) return null;
 
-  const [similar, incident] = await Promise.all([
+  const [similar, incident, reverts] = await Promise.all([
     findSimilarDeployments(deploymentId),
     deployment.status === "FAILED" ? getIncidentForDeployment(deploymentId) : Promise.resolve(null),
+    getRevertFacts(deploymentId),
   ]);
   if (!similar) return null;
 
@@ -59,6 +62,8 @@ export async function buildRiskEvidence(deploymentId: string): Promise<RiskEvide
       added_files: deployment.added_files,
       modified_files: deployment.modified_files,
       deleted_files: deployment.deleted_files,
+      reverts: reverts.reverts && { deployment_id: reverts.reverts.deployment_id, hours_after: reverts.reverts.hours_after },
+      reverted_by: reverts.reverted_by && { deployment_id: reverts.reverted_by.deployment_id, hours_after: reverts.reverted_by.hours_after },
     },
     change_analysis: {
       change_categories: similar.deployment.change_categories,
@@ -92,6 +97,9 @@ export async function buildRiskEvidence(deploymentId: string): Promise<RiskEvide
       "historical_evidence.matches is the COMPLETE list of past deployments available for this analysis. No other deployments exist for you.",
       "similarity_score is DeployGuard's rule-based ranking heuristic (see matched_signals). It is not a probability.",
       "root_cause, resolution = null means NOT KNOWN. Do not fill them in or guess them.",
+      "incident.provenance HUMAN-CONFIRMED means a person recorded root_cause / resolution / affected_service / downstream_effect after the failure; NOT DETERMINED means nobody has. Only HUMAN-CONFIRMED values may be stated as the cause or fix.",
+      "incident.probable_flake = true means a re-run of the SAME commit later passed with no code change: the failure was probably intermittent, not caused by that change.",
+      "reverted_by / reverts are revert commits observed by DeployGuard (a later push that reverted the deployment). They are facts about what happened, not a diagnosis.",
       "A recorded SUCCESS means the GitHub Actions pipeline completed install, tests, build and a simulated deployment.",
       "Pipeline status RECEIVED means CI has not reported yet; BUILDING means CI is running. No test or build result exists yet in either case.",
       ...(matches.length === 0
@@ -128,6 +136,9 @@ export function protectEvidence(e: RiskEvidence): RiskEvidence {
       error_message: sanitizeNullable(i.error_message, L.failureOutput, "end"),
       root_cause: sanitizeNullable(i.root_cause, L.failureOutput),
       resolution: sanitizeNullable(i.resolution, L.failureOutput),
+      // Stage 4.1: human input is untrusted content too.
+      ...(i.affected_service !== undefined ? { affected_service: sanitizeNullable(i.affected_service, L.short) } : {}),
+      ...(i.downstream_effect !== undefined ? { downstream_effect: sanitizeNullable(i.downstream_effect, L.failureOutput) } : {}),
     };
   const protectedBundle: RiskEvidence = {
     ...e,
@@ -184,6 +195,7 @@ export function toEvidenceMatch(m: HistoricalEvidence): EvidenceMatch {
     similarity_score: m.similarity_score,
     relevance: m.relevance,
     matched_signals: m.matched_signals.map((s) => `${s.signal}: ${s.value} (+${s.points})`),
+    reverted_by: m.reverted_by,
   };
 }
 
@@ -204,12 +216,19 @@ function pipelineState(d: Deployment): string {
 }
 
 function toEvidenceIncident(i: Incident): EvidenceIncident {
+  const confirmed = i.confirmed_revision !== null;
   return {
     id: i.id,
     failure_type: i.failure_type,
     error_message: clip(i.error_message),
-    root_cause: i.root_cause,
-    resolution: i.resolution,
+    // Stage 4.1: the cause fields are used only when a person confirmed them.
+    root_cause: confirmed ? i.root_cause : null,
+    resolution: confirmed ? i.resolution : null,
+    affected_service: confirmed ? i.affected_service : null,
+    downstream_effect: confirmed ? i.downstream_effect : null,
+    provenance: confirmed ? "HUMAN-CONFIRMED" : "NOT DETERMINED",
+    confirmed_at: confirmed ? i.confirmed_at?.toISOString() ?? null : null,
+    probable_flake: i.flake_status === "probable_flake",
   };
 }
 
@@ -231,10 +250,15 @@ function fingerprintOf(e: RiskEvidence): string {
     version: RISK_PROMPT_VERSION,
     current: e.current_deployment,
     analysis: e.change_analysis,
-    pipeline: { status: e.current_pipeline.status, failure: e.current_pipeline.failure, incident: e.current_pipeline.incident?.id ?? null },
+    pipeline: { status: e.current_pipeline.status, failure: e.current_pipeline.failure, incident: incidentFacts(e.current_pipeline.incident) },
+    // Stage 4: a newly confirmed cause, a flake marker or a revert are new facts too.
     matches: e.historical_evidence.matches
-      .map((m) => ({ id: m.deployment_id, status: m.status, incident: m.incident?.id ?? null }))
+      .map((m) => ({ id: m.deployment_id, status: m.status, incident: incidentFacts(m.incident), reverted_by: m.reverted_by?.deployment_id ?? null }))
       .sort((a, b) => a.id.localeCompare(b.id)),
   };
   return crypto.createHash("sha256").update(JSON.stringify(facts)).digest("hex");
+}
+
+function incidentFacts(i: EvidenceIncident | null) {
+  return i ? { id: i.id, confirmed_at: i.confirmed_at ?? null, probable_flake: i.probable_flake ?? false } : null;
 }

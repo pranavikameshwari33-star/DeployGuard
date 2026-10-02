@@ -5,4 +5,6 @@ export const JOB_TYPES = {
   incidentMemory: "memory.incident",
   riskAnalyze: "risk.analyze",
   installationReconcile: "installation.reconcile",
+  /** Stage 4.1: one bounded re-evaluation after a confirmed cause changed. */
+  learningReevaluate: "learning.reevaluate",
 } as const;

@@ -5,7 +5,8 @@ import {
   type DeploymentStatus,
   type StatusUpdate,
 } from "@/lib/db/deployments";
-import { recordIncident, type IncidentResult } from "@/lib/db/incidents";
+import { markProbableFlake, recordIncident, type IncidentResult } from "@/lib/db/incidents";
+import { recordRiskOutcome } from "@/lib/db/learning";
 import { enqueue } from "@/lib/jobs/queue";
 import { JOB_TYPES } from "@/lib/jobs/types";
 import { kickQueue } from "@/lib/jobs/runner";
@@ -32,6 +33,8 @@ export type ApplyStatusResult =
       deployment: Deployment;
       previousStatus: DeploymentStatus;
       incident?: IncidentResult;
+      /** Stage 4.4: set when this SUCCESS turned an earlier failure of the same commit into a probable flake. */
+      flakeIncidentId?: string;
       incidentMemory?: MemoryWrite;
       memory: MemoryWrite | { skipped: string };
       riskRefreshScheduled: boolean;
@@ -97,6 +100,36 @@ export async function applyPipelineStatus(
     }
   }
 
+  // ---------- Stage 4.4: a re-run of the same commit passed -> probable flake ----------
+  let flakeIncidentId: string | undefined;
+  if (deployment.status === "SUCCESS") {
+    try {
+      const flake = await markProbableFlake(deployment);
+      if (flake) {
+        flakeIncidentId = flake.incident.id;
+        console.log(
+          `[DeployGuard][learning] Incident #${flake.incident.id} marked probable flake: a re-run of commit ` +
+            `${deployment.commit_sha.slice(0, 7)} passed (run ${flake.evidence.passing_run.id ?? "not reported"}).`
+        );
+      }
+    } catch (error) {
+      // Learning is best effort: the lifecycle result is already stored.
+      console.error(`[DeployGuard][learning] Flake check failed for deployment #${deployment.id}: ${(error as Error).message}`);
+    }
+  }
+
+  // ---------- Stage 4.2: compare the stored prediction with the outcome ----------
+  // Before the risk refresh below, which produces a post-result assessment that
+  // is never scored anyway (see lib/learning/accuracy.ts).
+  if (deployment.status === "SUCCESS" || deployment.status === "FAILED") {
+    try {
+      const score = await recordRiskOutcome(deployment);
+      if (score) console.log(`[DeployGuard][learning] Deployment #${deployment.id} ${deployment.status}: prediction ${score.predicted_level ?? "none"} -> ${score.result}.`);
+    } catch (error) {
+      console.error(`[DeployGuard][learning] Could not record the outcome for deployment #${deployment.id}: ${(error as Error).message}`);
+    }
+  }
+
   // ---------- agent memory (Stage 2: queued, final results only) ----------
   // BUILDING is a passing moment and is not worth remembering. The final result
   // REPLACES the memory the webhook wrote (same document_id). The Hindsight
@@ -122,7 +155,7 @@ export async function applyPipelineStatus(
     (deployment.status === "SUCCESS" || deployment.status === "FAILED") && deployment.risk_analysis_status !== null;
   if (riskRefreshScheduled) await scheduleRiskAnalysis(deployment.id, `ci ${deployment.status}`);
 
-  return { outcome: "updated", deployment, previousStatus, incident, incidentMemory, memory, riskRefreshScheduled };
+  return { outcome: "updated", deployment, previousStatus, incident, flakeIncidentId, incidentMemory, memory, riskRefreshScheduled };
 }
 
 /**

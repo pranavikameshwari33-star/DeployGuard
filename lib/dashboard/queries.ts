@@ -1,6 +1,6 @@
 import { getPool } from "@/lib/db/client";
 import { getDeploymentById, type Deployment, type DeploymentScope } from "@/lib/db/deployments";
-import type { Incident, IncidentListItem } from "@/lib/db/incidents";
+import { incidentColumns, listConfirmations, type Incident, type IncidentConfirmation, type IncidentListItem } from "@/lib/db/incidents";
 
 /**
  * Stage 3: the dashboard's scoped reads. Every query takes the viewer's scope
@@ -27,8 +27,7 @@ export async function listDeploymentsPage(v: ViewScope, limit: number, offset: n
 
 export async function listIncidentsScoped(v: ViewScope, limit: number): Promise<IncidentListItem[]> {
   const { rows } = await getPool().query<IncidentListItem>(
-    `SELECT i.id, i.deployment_id, i.failure_type, i.failure_job, i.error_message,
-            i.affected_service, i.downstream_effect, i.root_cause, i.resolution, i.created_at,
+    `SELECT ${incidentColumns("i")},
             d.owner || '/' || d.repository AS repository, d.branch, d.commit_sha,
             d.status AS deployment_status, d.failure_stage
      FROM incidents i JOIN deployments d ON d.id = i.deployment_id
@@ -89,13 +88,14 @@ export type IncidentDetail = {
   deployment: Deployment;
   /** Other incidents of the same repository with the same failure type (observed fact, not a causal claim). */
   related: (IncidentListItem & { deployment_created_at: Date })[];
+  /** Stage 4.1: the confirmation edit history, newest first. */
+  confirmations: IncidentConfirmation[];
 };
 
 /** One incident, only if its deployment is inside the viewer's scope (otherwise null, like a missing one). */
 export async function getIncidentDetail(incidentId: string, v: ViewScope): Promise<IncidentDetail | null> {
   const { rows } = await getPool().query<Incident>(
-    `SELECT i.id, i.deployment_id, i.failure_type, i.failure_job, i.error_message, i.affected_service,
-            i.downstream_effect, i.root_cause, i.resolution, i.created_at
+    `SELECT ${incidentColumns("i")}
      FROM incidents i JOIN deployments d ON d.id = i.deployment_id
      WHERE i.id = $4 AND ${SCOPE_SQL}`,
     [...scopeParams(v), incidentId]
@@ -105,8 +105,7 @@ export async function getIncidentDetail(incidentId: string, v: ViewScope): Promi
   const deployment = await getDeploymentById(incident.deployment_id);
   if (!deployment) return null;
   const related = await getPool().query<IncidentListItem & { deployment_created_at: Date }>(
-    `SELECT i.id, i.deployment_id, i.failure_type, i.failure_job, i.error_message,
-            i.affected_service, i.downstream_effect, i.root_cause, i.resolution, i.created_at,
+    `SELECT ${incidentColumns("i")},
             d.owner || '/' || d.repository AS repository, d.branch, d.commit_sha,
             d.status AS deployment_status, d.failure_stage, d.created_at AS deployment_created_at
      FROM incidents i JOIN deployments d ON d.id = i.deployment_id
@@ -115,5 +114,5 @@ export async function getIncidentDetail(incidentId: string, v: ViewScope): Promi
      ORDER BY i.created_at DESC LIMIT 10`,
     [...scopeParams(v), incidentId, incident.failure_type, deployment.github_repository_id]
   );
-  return { incident, deployment, related: related.rows };
+  return { incident, deployment, related: related.rows, confirmations: await listConfirmations(incident.id) };
 }

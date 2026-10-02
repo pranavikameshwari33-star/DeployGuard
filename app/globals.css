@@ -392,3 +392,28 @@ a:focus-visible, button:focus-visible, select:focus-visible {
   .switcher select { max-width: 100%; }
   .context-bar { align-items: stretch; }
 }
+
+/* ---- Stage 4: learning features ------------------------------------------- */
+.prov-confirmed { border-color: var(--blue-border); color: var(--blue-text); background: var(--blue-bg); }
+.field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.field > span { font-weight: 600; }
+.field input, .field textarea, .ask-form input {
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  width: 100%;
+}
+.field textarea { min-height: 64px; resize: vertical; }
+.confirm-form { display: grid; gap: 10px; }
+.form-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.ask-form { display: flex; gap: 8px; flex-wrap: wrap; }
+.ask-form input { flex: 1 1 260px; width: auto; }
+.statements { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.statements li { font-size: 13px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 4px; overflow-wrap: anywhere; }
+.history-revisions { font-size: 13px; }
+input:focus-visible, textarea:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+.panel-head-inline { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }

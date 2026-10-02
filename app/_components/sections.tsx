@@ -24,8 +24,12 @@ import {
   statusTone,
   type Tone,
 } from "./format";
+import type { AccuracyRecord, FailurePattern, RevertFacts } from "@/lib/db/learning";
+import type { AskResult } from "@/lib/learning/ask-history";
+import { SMALL_SAMPLE } from "@/lib/learning/accuracy";
 import type { Links } from "./links";
 import { ReanalyzeButton } from "./reanalyze-button";
+import { ConfirmIncidentForm } from "./confirm-incident-form";
 
 /**
  * Dashboard sections (Phase 8; Stage 3 adds provenance, the evidence trace,
@@ -43,13 +47,25 @@ export function Badge({ tone, children }: { tone: Tone; children: ReactNode }) {
   return <span className={`badge tone-${tone}`}>{children}</span>;
 }
 
-export type ProvenanceKind = "observed" | "history" | "memory" | "ai";
+export type ProvenanceKind = "observed" | "history" | "memory" | "ai" | "confirmed";
 const PROVENANCE: Record<ProvenanceKind, string> = {
   observed: "Observed fact",
   history: "Historical evidence",
   memory: "Recalled memory",
   ai: "AI reasoning",
+  // Stage 4.1: recorded by a person after the failure, attributed and versioned.
+  confirmed: "Human-confirmed",
 };
+
+/** Stage 4.1: a cause field -- the confirmed value with its label, or "Not determined". */
+function Confirmed({ value, incident }: { value: string | null; incident: Pick<Incident, "confirmed_revision"> }) {
+  if (incident.confirmed_revision === null || value === null) return <Unknown />;
+  return (
+    <>
+      {value} <Prov kind="confirmed" />
+    </>
+  );
+}
 
 /** A text label (never colour alone) saying where a piece of content comes from. */
 export function Prov({ kind }: { kind: ProvenanceKind }) {
@@ -552,7 +568,17 @@ function Step({ label, state }: { label: string; state: "done" | "failed" | "act
   );
 }
 
-export function PipelinePanel({ d, incident, links }: { d: DashboardDeployment; incident: Incident | null; links: Links }) {
+export function PipelinePanel({
+  d,
+  incident,
+  reverts,
+  links,
+}: {
+  d: DashboardDeployment;
+  incident: Incident | null;
+  reverts?: RevertFacts;
+  links: Links;
+}) {
   const s = d.status;
   const building: "done" | "active" | "waiting" = s === "BUILDING" ? "active" : s === "RECEIVED" ? "waiting" : "done";
   const final = s === "SUCCESS" ? "SUCCESS" : s === "FAILED" ? "FAILED" : "RESULT";
@@ -599,9 +625,33 @@ export function PipelinePanel({ d, incident, links }: { d: DashboardDeployment; 
                 <a href={links.incident(incident.id)}>#{incident.id}</a> · {incident.failure_type}
               </dd>
               <dt>Root cause</dt>
-              <dd>{incident.root_cause ?? <Unknown />}</dd>
+              <dd><Confirmed value={incident.root_cause} incident={incident} /></dd>
               <dt>Resolution</dt>
-              <dd>{incident.resolution ?? <Unknown />}</dd>
+              <dd><Confirmed value={incident.resolution} incident={incident} /></dd>
+              {incident.flake_status === "probable_flake" ? (
+                <>
+                  <dt>Flake</dt>
+                  <dd>
+                    <Badge tone="amber">Probable flake</Badge> A re-run of the same commit passed afterwards.
+                  </dd>
+                </>
+              ) : null}
+            </>
+          ) : null}
+          {reverts?.reverts ? (
+            <>
+              <dt>Revert of</dt>
+              <dd>
+                <a href={links.deployment(reverts.reverts.deployment_id)}>#{reverts.reverts.deployment_id}</a>, {reverts.reverts.hours_after} h after it
+              </dd>
+            </>
+          ) : null}
+          {reverts?.reverted_by ? (
+            <>
+              <dt>Reverted by</dt>
+              <dd>
+                <a href={links.deployment(reverts.reverted_by.deployment_id)}>#{reverts.reverted_by.deployment_id}</a>, {reverts.reverted_by.hours_after} h later
+              </dd>
             </>
           ) : null}
         </dl>
@@ -666,7 +716,15 @@ export function HistoricalEvidence({ evidence, links }: { evidence: SelectedDepl
                     {m.incident ? (
                       <span className="sub">
                         <a href={links.incident(m.incident.id)}>Incident #{m.incident.id}</a> · root cause{" "}
-                        {m.incident.root_cause ?? "not determined"}
+                        {m.incident.root_cause && m.incident.provenance === "HUMAN-CONFIRMED"
+                          ? `${m.incident.root_cause} (human-confirmed)`
+                          : "not determined"}
+                        {m.incident.probable_flake ? " · probable flake" : ""}
+                      </span>
+                    ) : null}
+                    {m.reverted_by ? (
+                      <span className="sub">
+                        Reverted by <a href={links.deployment(m.reverted_by.deployment_id)}>#{m.reverted_by.deployment_id}</a>
                       </span>
                     ) : null}
                   </td>
@@ -784,6 +842,8 @@ export function DeploymentHistory({
                 </td>
                 <td>
                   <Badge tone={statusTone(r.status)}>{r.status}</Badge>
+                  {r.probable_flake ? <span className="sub">failed first; probable flake</span> : null}
+                  {r.reverted ? <span className="sub">reverted</span> : null}
                 </td>
                 <td>
                   <Time iso={r.created_at} />
@@ -884,15 +944,16 @@ export function IncidentHistory({ rows, links }: { rows: IncidentListItem[]; lin
                   <td className="nowrap">
                     <a href={links.incident(i.id)}>#{i.id}</a>
                     <span className="sub">{i.failure_type}</span>
+                    {i.flake_status === "probable_flake" ? <span className="sub">probable flake</span> : null}
                   </td>
                   <td className="nowrap">
                     <a href={links.deployment(i.deployment_id)}>#{i.deployment_id}</a>
                     <span className="sub">{i.repository}</span>
                   </td>
                   <td>{i.failure_stage ?? <Unknown />}</td>
-                  <td>{i.affected_service ?? <Unknown />}</td>
+                  <td><Confirmed value={i.affected_service} incident={i} /></td>
                   <td className="col-msg">{lastLine(i.error_message) ?? <Unknown />}</td>
-                  <td>{i.resolution ?? <Unknown />}</td>
+                  <td><Confirmed value={i.resolution} incident={i} /></td>
                   <td>
                     <Time iso={i.created_at} />
                   </td>
@@ -906,8 +967,15 @@ export function IncidentHistory({ rows, links }: { rows: IncidentListItem[]; lin
   );
 }
 
-export function IncidentDetail({ data, links }: { data: IncidentDetailData; links: Links }) {
-  const { incident: i, deployment: d, related } = data;
+export function IncidentDetail({ data, links, canConfirm }: { data: IncidentDetailData; links: Links; canConfirm: boolean }) {
+  const { incident: i, deployment: d, related, confirmations } = data;
+  const confirmed = i.confirmed_revision !== null;
+  const runLink = (url: string | null, id: string | null, fallback: string) =>
+    url && /^https:\/\/github\.com\//.test(url) ? (
+      <a href={url} target="_blank" rel="noreferrer">GitHub Actions run #{id ?? "view"}</a>
+    ) : (
+      <span className="faint">{fallback}</span>
+    );
   return (
     <Panel title={`Incident #${i.id}`} id="incident" prov="observed" aside={<a href={links.home()}>Back to dashboard</a>}>
       <div className="panel-body">
@@ -925,47 +993,296 @@ export function IncidentDetail({ data, links }: { data: IncidentDetailData; link
           <dd>{d.failure_stage ?? <Unknown />}</dd>
           <dt>Failed job</dt>
           <dd>{i.failure_job ?? d.failure_job ?? <Unknown />}</dd>
-          <dt>Service</dt>
-          <dd>{i.affected_service ?? <Unknown />}</dd>
-          <dt>Downstream effect</dt>
-          <dd>{i.downstream_effect ?? <Unknown />}</dd>
-          <dt>Root cause</dt>
-          <dd>{i.root_cause ?? <Unknown />}</dd>
-          <dt>Resolution</dt>
-          <dd>{i.resolution ?? <Unknown />}</dd>
-          <dt>CI run</dt>
-          <dd>
-            {d.ci_run_url && /^https:\/\/github\.com\//.test(d.ci_run_url) ? (
-              <a href={d.ci_run_url} target="_blank" rel="noreferrer">GitHub Actions run #{d.ci_run_id ?? "view"}</a>
-            ) : (
-              <Unknown />
-            )}
-          </dd>
+          <dt>Failed run</dt>
+          <dd>{runLink(i.failed_ci_run_url ?? d.ci_run_url, i.failed_ci_run_id ?? d.ci_run_id, "Not reported")}</dd>
+          {i.error_signature ? (
+            <>
+              <dt>Error signature</dt>
+              <dd className="num small">{i.error_signature}</dd>
+            </>
+          ) : null}
         </dl>
-        <p className="footnote">
-          Everything above was observed by DeployGuard from the pipeline. Root cause, resolution, service and downstream
-          effect are only filled in when they are actually known; DeployGuard never guesses them.
-        </p>
+
+        {i.flake_status === "probable_flake" ? (
+          <div className="note" role="note">
+            <Badge tone="amber">Probable flake</Badge> The same commit failed in{" "}
+            {runLink(i.failed_ci_run_url, i.failed_ci_run_id, "a run that was not reported")} and then passed in{" "}
+            {runLink(i.flake_passing_run_url, i.flake_passing_run_id, "a later run")}
+            {i.flake_detected_at ? <> (seen {absoluteTime(i.flake_detected_at)})</> : null}, with no code change. The incident is kept;
+            it counts less in similarity and is left out of recurring patterns.
+          </div>
+        ) : null}
+
         <div>
           <span className="label">Observed output (redacted, last lines)</span>
           {i.error_message ? <pre className="output">{i.error_message}</pre> : <p className="muted small">No output is stored (none was reported, or it passed its retention period).</p>}
         </div>
-        <div>
-          <span className="label">Other incidents of this repository with the same failure type</span>
-          {related.length === 0 ? (
-            <p className="muted small">None recorded.</p>
-          ) : (
-            <ul className="plain-list">
-              {related.map((r) => (
-                <li key={r.id}>
-                  <a href={links.incident(r.id)}>Incident #{r.id}</a> on <a href={links.deployment(r.deployment_id)}>deployment #{r.deployment_id}</a>{" "}
-                  ({r.branch}, <Time iso={r.created_at} />)
+      </div>
+
+      <div className="panel-body bordered-top">
+        <div className="panel-head-inline">
+          <span className="label">Cause and resolution</span> {confirmed ? <Prov kind="confirmed" /> : null}
+        </div>
+        <dl className="facts">
+          <dt>Root cause</dt>
+          <dd><Confirmed value={i.root_cause} incident={i} /></dd>
+          <dt>Resolution</dt>
+          <dd><Confirmed value={i.resolution} incident={i} /></dd>
+          <dt>Service</dt>
+          <dd><Confirmed value={i.affected_service} incident={i} /></dd>
+          <dt>Downstream effect</dt>
+          <dd><Confirmed value={i.downstream_effect} incident={i} /></dd>
+          {confirmed ? (
+            <>
+              <dt>Confirmed by</dt>
+              <dd>
+                @{i.confirmed_by_login} · {i.confirmed_at ? absoluteTime(i.confirmed_at) : "time not recorded"} · revision {i.confirmed_revision}
+              </dd>
+            </>
+          ) : null}
+        </dl>
+        <p className="footnote">
+          DeployGuard never guesses these. They are filled in only when a person who owns this repository confirms them, and
+          each change is kept as a revision. Confirmed values are used as evidence in later risk analyses, labelled as human-confirmed.
+        </p>
+        {canConfirm ? (
+          <details>
+            <summary className="small">{confirmed ? "Edit the confirmed cause" : "Record the confirmed cause"}</summary>
+            <ConfirmIncidentForm
+              incidentId={i.id}
+              revision={i.confirmed_revision ?? 0}
+              initial={{
+                root_cause: i.root_cause ?? "",
+                resolution: i.resolution ?? "",
+                affected_service: i.affected_service ?? "",
+                downstream_effect: i.downstream_effect ?? "",
+              }}
+            />
+          </details>
+        ) : null}
+        {confirmations.length > 0 ? (
+          <details className="history-revisions">
+            <summary className="small">Edit history ({confirmations.length} revision{confirmations.length === 1 ? "" : "s"})</summary>
+            <ol className="plain-list" reversed>
+              {confirmations.map((c) => (
+                <li key={c.revision}>
+                  Revision {c.revision} by @{c.confirmed_by_login}, {absoluteTime(c.confirmed_at)}: root cause{" "}
+                  {c.root_cause ?? "not known"}; resolution {c.resolution ?? "not known"}; service {c.affected_service ?? "not known"};
+                  downstream effect {c.downstream_effect ?? "not known"}.
+                  {c.redaction?.count ? <span className="faint"> ({c.redaction.count} value(s) masked)</span> : null}
                 </li>
               ))}
-            </ul>
-          )}
-          <p className="footnote">Same failure type is an observation, not a claim that the incidents share a cause.</p>
+            </ol>
+          </details>
+        ) : null}
+      </div>
+
+      <div className="panel-body bordered-top">
+        <span className="label">Other incidents of this repository with the same failure type</span>
+        {related.length === 0 ? (
+          <p className="muted small">None recorded.</p>
+        ) : (
+          <ul className="plain-list">
+            {related.map((r) => (
+              <li key={r.id}>
+                <a href={links.incident(r.id)}>Incident #{r.id}</a> on <a href={links.deployment(r.deployment_id)}>deployment #{r.deployment_id}</a>{" "}
+                ({r.branch}, <Time iso={r.created_at} />){r.flake_status === "probable_flake" ? " · probable flake" : ""}
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="footnote">Same failure type is an observation, not a claim that the incidents share a cause.</p>
+      </div>
+    </Panel>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4: what DeployGuard has learned
+// ---------------------------------------------------------------------------
+
+const DIMENSION_TEXT: Record<FailurePattern["dimension"], string> = {
+  error_signature: "Same error output",
+  failed_stage: "Same failed stage",
+  component: "Same component",
+  category: "Same kind of change",
+};
+
+const ordinal = (n: number) => (n === 1 ? "1st" : n === 2 ? "2nd" : n === 3 ? "3rd" : `${n}th`);
+
+export function FailurePatterns({ patterns, windowDays, links }: { patterns: FailurePattern[]; windowDays: number; links: Links }) {
+  return (
+    <Panel title="Recurring failure patterns" id="patterns" prov="observed" aside={`Last ${windowDays} days`}>
+      {patterns.length === 0 ? (
+        <div className="empty">No failure has repeated in the last {windowDays} days.</div>
+      ) : (
+        <div className="table-wrap">
+          <table className="data">
+            <caption className="visually-hidden">Recurring failure patterns</caption>
+            <thead>
+              <tr>
+                <th scope="col">Observation</th>
+                <th scope="col">Shared value</th>
+                <th scope="col">Repository</th>
+                <th scope="col">Incidents (evidence)</th>
+                <th scope="col">Latest</th>
+              </tr>
+            </thead>
+            <tbody>
+              {patterns.map((p) => (
+                <tr key={`${p.dimension}:${p.github_repository_id}:${p.value}`}>
+                  <td>
+                    {DIMENSION_TEXT[p.dimension]}: {ordinal(p.count)} failure in {windowDays} days
+                    {p.flakes_excluded ? <span className="sub">{p.flakes_excluded} probable flake(s) not counted</span> : null}
+                  </td>
+                  <td className="col-msg num small">{p.value}</td>
+                  <td>{p.repository}</td>
+                  <td>
+                    {p.incident_ids.map((id, n) => (
+                      <span key={id}>
+                        {n ? ", " : ""}
+                        <a href={links.incident(id)}>#{id}</a>
+                      </span>
+                    ))}
+                  </td>
+                  <td>
+                    <Time iso={p.last_at} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
+      )}
+      <div className="panel-body bordered-top compact">
+        <p className="footnote">
+          Computed from recorded incidents. A pattern says these failures share something; it does not say they share a cause.
+        </p>
+      </div>
+    </Panel>
+  );
+}
+
+const RESULT_TEXT: Record<AccuracyRecord["rows"][number]["result"], { label: string; tone: Tone }> = {
+  hit: { label: "Hit", tone: "green" },
+  miss: { label: "Miss", tone: "red" },
+  false_alarm: { label: "False alarm", tone: "amber" },
+  unscored: { label: "Unscored", tone: "gray" },
+};
+
+export function AccuracyRecordPanel({ record, links }: { record: AccuracyRecord; links: Links }) {
+  const c = record.counts;
+  const levels = ["HIGH", "MEDIUM", "LOW", "none"].filter((l) => record.matrix[l]);
+  return (
+    <Panel title="Risk prediction record" id="accuracy" prov="observed" aside={`Rule ${record.ruleVersion}`}>
+      <div className="panel-body compact">
+        <dl className="counts" aria-label="Prediction outcomes">
+          <div><dt>Finished deployments</dt><dd className="num">{c.total}</dd></div>
+          <div><dt>Scored</dt><dd className="num">{c.scored}</dd></div>
+          <div><dt>Hits</dt><dd className="num">{c.hit}</dd></div>
+          <div><dt>Misses</dt><dd className="num">{c.miss}</dd></div>
+          <div><dt>False alarms</dt><dd className="num">{c.false_alarm}</dd></div>
+          <div><dt>Unscored</dt><dd className="num">{c.unscored}</dd></div>
+        </dl>
+        {c.scored < SMALL_SAMPLE ? (
+          <p className="note" role="note">
+            Small sample: {c.scored} scored prediction{c.scored === 1 ? "" : "s"}. These counts say what happened; they are too few to say how
+            reliable the predictions are.
+          </p>
+        ) : null}
+        <p className="footnote">
+          The prediction is the last assessment made before CI finished. HIGH then FAILED, or LOW then SUCCESS, is a hit; LOW then FAILED is a miss;
+          HIGH then SUCCESS is a false alarm. MEDIUM, or no assessment before the result, is unscored. Predictions are never edited.
+        </p>
+      </div>
+      {levels.length ? (
+        <div className="table-wrap bordered-top">
+          <table className="data">
+            <caption className="visually-hidden">Predicted level by outcome (counts)</caption>
+            <thead>
+              <tr>
+                <th scope="col">Predicted</th>
+                <th scope="col">Then FAILED</th>
+                <th scope="col">Then SUCCESS</th>
+              </tr>
+            </thead>
+            <tbody>
+              {levels.map((l) => (
+                <tr key={l}>
+                  <th scope="row">{l === "none" ? "No prediction" : l}</th>
+                  <td className="num">{record.matrix[l].FAILED}</td>
+                  <td className="num">{record.matrix[l].SUCCESS}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+      {record.rows.length ? (
+        <details className="panel-body bordered-top compact">
+          <summary className="small">The underlying deployments (latest {record.rows.length})</summary>
+          <ul className="plain-list">
+            {record.rows.map((r) => (
+              <li key={r.deployment_id}>
+                <a href={links.deployment(r.deployment_id)}>#{r.deployment_id}</a> {shortSha(r.commit_sha)} · predicted{" "}
+                {r.predicted_level ?? "nothing"} · {r.outcome_status} · <Badge tone={RESULT_TEXT[r.result].tone}>{RESULT_TEXT[r.result].label}</Badge>
+                {r.unscored_reason ? <span className="faint"> ({r.unscored_reason})</span> : null}
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : (
+        <div className="empty">No deployment has finished CI since prediction tracking started.</div>
+      )}
+    </Panel>
+  );
+}
+
+export function AskHistory({ result, repo, links }: { result: AskResult | null; repo: string | null; links: Links }) {
+  return (
+    <Panel title="Ask your history" id="ask" prov="history">
+      <div className="panel-body">
+        <form className="ask-form" action="/" method="get" role="search">
+          {repo ? <input type="hidden" name="repo" value={repo} /> : null}
+          <label htmlFor="ask-q" className="visually-hidden">Question about your deployment history</label>
+          <input
+            id="ask-q"
+            name="ask"
+            maxLength={300}
+            defaultValue={result?.question ?? ""}
+            placeholder="Have we seen a database connection timeout before?"
+          />
+          <button type="submit" className="button">Ask</button>
+        </form>
+        {result === null ? (
+          <p className="footnote">
+            Answers come only from your recorded deployments and incidents, with a link to each record. Questions about anything else are declined.
+          </p>
+        ) : result.state !== "answered" ? (
+          <p className="note" role="status">{result.message}</p>
+        ) : (
+          <div role="status">
+            <p>{result.answer.summary}</p>
+            {result.answer.statements.length ? (
+              <ul className="statements">
+                {result.answer.statements.map((s) => (
+                  <li key={s.deployment_id}>
+                    {s.text}{" "}
+                    <a href={links.deployment(s.deployment_id)}>Deployment #{s.deployment_id}</a>
+                    {s.incident_id ? <> · <a href={links.incident(s.incident_id)}>Incident #{s.incident_id}</a></> : null}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            <p className="footnote">
+              Every line is a database record. {result.memory === "used"
+                ? "Memory recall only helped find candidate records."
+                : result.memory === "unavailable"
+                  ? "Memory recall was unavailable; this was answered from the database alone."
+                  : ""}
+            </p>
+          </div>
+        )}
       </div>
     </Panel>
   );

@@ -9,6 +9,7 @@ import { enqueue, pruneSucceeded, queueStats, reclaimStuck, type QueueStats } fr
 import { JOB_TYPES } from "@/lib/jobs/types";
 import { drainQueue, type DrainReport } from "@/lib/jobs/runner";
 import { applyRetention, type RetentionReport } from "@/lib/lifecycle/retention";
+import { backfillErrorSignatures } from "@/lib/db/incidents";
 
 /**
  * Phase 10: the maintenance / reconciliation run.
@@ -52,6 +53,8 @@ export type MaintenanceReport = {
   stalePipelines: { deploymentId: string; result: string }[];
   resumedRiskAnalyses: string[];
   retention: RetentionReport | null;
+  /** Stage 4.3: incidents given an error signature this run. */
+  signaturesBackfilled: number;
   drain: DrainReport | null;
   queue: QueueStats | null;
   errors: string[];
@@ -89,6 +92,7 @@ export async function runMaintenance(options: { budgetMs?: number } = {}): Promi
     stalePipelines: [],
     resumedRiskAnalyses: [],
     retention: null,
+    signaturesBackfilled: 0,
     drain: null,
     queue: null,
     errors: [],
@@ -193,6 +197,11 @@ export async function runMaintenance(options: { budgetMs?: number } = {}): Promi
   });
 
   // 8. drain the queue with whatever budget is left
+  // Stage 4.3: error signatures for incidents recorded before Stage 4 (bounded).
+  await step("error signatures", async () => {
+    report.signaturesBackfilled = await backfillErrorSignatures(500);
+  });
+
   await step("drain queue", async () => {
     const remaining = budgetMs - (Date.now() - started);
     report.drain = await drainQueue({ budgetMs: Math.max(0, remaining - 2_000), maxJobs: 100 });

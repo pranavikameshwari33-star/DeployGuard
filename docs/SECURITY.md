@@ -99,11 +99,14 @@ deployment memories with the internal `/api/memory/backfill` endpoint.
   must equal the request's own origin, the Host header's origin, or
   `DEPLOYGUARD_BASE_URL`; a request with neither is refused. Bearer-token requests are
   exempt (a token is not an ambient credential). Applied to: Re-analyze
-  (`POST /api/deployments/risk`) and logout. Every future state-changing route
-  (disconnect, root cause, purge, settings) must call `checkSameOrigin()`.
+  (`POST /api/deployments/risk`) and logout; Stage 2 purge; Stage 4 incident confirmation
+  (`POST /api/incidents/confirmation`, session only -- a Bearer token is refused there,
+  because a confirmation must be attributable to a person). Every future state-changing
+  route (disconnect, settings) must call `checkSameOrigin()`.
 * **Rate limits** (PostgreSQL, fails open): sign-in start/callback/install, logout,
   risk analysis per user, forced refresh per user, memory recall per user, webhook intake
-  and CI status per source address. Client address = the entry appended by the trusted
+  and CI status per source address; Stage 4: incident confirmations and ask-history
+  questions per user. Client address = the entry appended by the trusted
   proxy (`DEPLOYGUARD_TRUSTED_PROXY_HOPS`, default 1), not the client-controlled leftmost
   `X-Forwarded-For` entry (that was a bypass, fixed in Stage 1).
 * **Errors:** clients receive a generic message plus a short `errorRef`; the detail is
