@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { canAccessDeployment, errorDetail, getViewer } from "@/lib/auth/session";
-import { getDeploymentById } from "@/lib/db/deployments";
+import { finishRiskAnalysis, getDeploymentById, tryStartRiskAnalysis } from "@/lib/db/deployments";
 import { rateLimitResponse } from "@/lib/auth/rate-limit";
+import { checkSameOrigin } from "@/lib/auth/csrf";
 import { getLatestAssessment } from "@/lib/db/risk-assessments";
 import { analyzeDeploymentRisk } from "@/lib/risk/analyze-risk";
 
@@ -12,7 +13,8 @@ export const dynamic = "force-dynamic";
  * Phase 7: AI deployment risk analysis.
  *
  * POST /api/deployments/risk?id=<deploymentId>[&refresh=1]
- *   Authorization: Bearer <DEPLOYGUARD_STATUS_TOKEN>  -- or the owner's signed-in session (Phase 9)
+ *   Authorization: Bearer <DEPLOYGUARD_INTERNAL_TOKEN>  -- or the owner's signed-in session (Phase 9)
+ *   A session-authenticated call must come from DeployGuard's own origin (Stage 1 CSRF check).
  *   Gathers the evidence (Phase 5 + Phase 6), asks Gemini, validates, stores.
  *   Reuses the stored assessment when the facts have not changed; refresh=1
  *   forces a new Gemini call. Protected because each call can cost Gemini
@@ -25,7 +27,7 @@ export const dynamic = "force-dynamic";
  * "unavailable" -- never a made-up risk level.
  */
 export async function POST(request: Request) {
-  // Internal tooling (Bearer DEPLOYGUARD_STATUS_TOKEN) or, since Phase 9, the
+  // Internal tooling (Bearer DEPLOYGUARD_INTERNAL_TOKEN) or, since Phase 9, the
   // signed-in owner of the deployment. Anyone else gets 401 / 404.
   const viewer = await getViewer();
   if (!viewer) return NextResponse.json({ ok: false, error: "Unauthorized." }, { status: 401 });
@@ -36,19 +38,43 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: false, error: "Add a numeric deployment id: ?id=12" }, { status: 400 });
   }
   if (viewer.kind === "user") {
+    const csrf = checkSameOrigin(request);
+    if (!csrf.ok) {
+      console.warn(`[DeployGuard][csrf] Rejected risk analysis request: ${csrf.reason}.`);
+      return NextResponse.json({ ok: false, error: "Request rejected." }, { status: 403 });
+    }
     const deployment = await getDeploymentById(id);
     if (!deployment || !canAccessDeployment(viewer, deployment)) {
       return NextResponse.json({ ok: false, error: `No deployment #${id}.` }, { status: 404 });
     }
-    // Phase 10: a forced refresh always calls Gemini; limit it per user.
-    if (params.get("refresh") === "1") {
-      const limited = await rateLimitResponse(request, "riskRefresh", `user:${viewer.user.id}`);
-      if (limited) return limited;
+    // Stage 1: any analysis request may call Gemini; limit it per user.
+    const limitedAll = await rateLimitResponse(request, "riskAnalyze", `user:${viewer.user.id}`);
+    if (limitedAll) return limitedAll;
+  }
+
+  // Stage 2: a user's Re-analyze is controlled.
+  //  - It never forces a new Gemini call: the same evidence returns the stored
+  //    assessment, so it only reaches Gemini when the result is stale or missing.
+  //  - An in-flight lock stops a second request while one is running (409).
+  //  - The per-repository usage caps apply (429 when reached).
+  // Internal tooling may still force a refresh (?refresh=1).
+  let attempt: string | null = null;
+  if (viewer.kind === "user") {
+    attempt = await tryStartRiskAnalysis(id);
+    if (!attempt) {
+      return NextResponse.json({ ok: false, error: "An analysis for this deployment is already running." }, { status: 409 });
     }
   }
 
   try {
-    const result = await analyzeDeploymentRisk(id, { refresh: params.get("refresh") === "1" });
+    const result = await analyzeDeploymentRisk(id, { refresh: viewer.kind === "internal" && params.get("refresh") === "1" });
+    if (attempt) {
+      await finishRiskAnalysis(
+        id,
+        attempt,
+        result.status === "assessed" ? { status: "completed" } : { status: "unavailable", error: result.status === "unavailable" ? result.message : "not found" }
+      );
+    }
 
     if (result.status === "not_found") {
       return NextResponse.json({ ok: false, error: `No deployment #${id}.` }, { status: 404 });
@@ -57,7 +83,7 @@ export async function POST(request: Request) {
       // 503 when Gemini itself failed, 502 when it answered but the answer was invalid.
       return NextResponse.json(
         { ok: false, ...result, riskAssessment: null },
-        { status: result.reason === "gemini_error" ? 503 : 502 }
+        { status: result.reason === "usage_limit" ? 429 : result.reason === "gemini_error" ? 503 : 502 }
       );
     }
     return NextResponse.json({
@@ -69,6 +95,7 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     const message = (error as Error).message;
+    if (attempt) await finishRiskAnalysis(id, attempt, { status: "unavailable", error: "Risk analysis failed." }).catch(() => {});
     console.error(`[DeployGuard][risk] Risk analysis failed for deployment #${id}: ${message}`);
     return NextResponse.json(
       { ok: false, error: "Risk analysis failed.", ...errorDetail(viewer, message) },

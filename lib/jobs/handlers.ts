@@ -1,0 +1,122 @@
+import type { Job } from "@/lib/jobs/queue";
+import { JOB_TYPES } from "@/lib/jobs/types";
+import { getDeploymentById } from "@/lib/db/deployments";
+import { getIncidentForDeployment } from "@/lib/db/incidents";
+import { finishDelivery, getDeliveryPayload } from "@/lib/db/webhook-deliveries";
+import { retain } from "@/lib/hindsight/client";
+import { buildDeploymentMemory } from "@/lib/hindsight/deployment-memory";
+import { buildIncidentMemory } from "@/lib/hindsight/incident-memory";
+import { processWorkflowRun } from "@/lib/github/app-events";
+import { reconcileInstallation } from "@/lib/github/installations";
+import { runRiskAnalysis } from "@/lib/risk/auto-risk";
+import { runReevaluation } from "@/lib/learning/confirm-incident";
+import { refreshRepositoryInputs } from "@/lib/github/repo-inputs";
+import { processPullRequestEvent } from "@/lib/github/pull-request-check";
+import { processDeploymentStatusEvent, syncEnvironments } from "@/lib/github/environments";
+
+/**
+ * Stage 2: what each job type does. Every handler is idempotent -- running it
+ * twice (a retry after a lost acknowledgement, a reclaimed job) has the same
+ * effect as running it once: memories use document_id + replace, lifecycle
+ * updates are guarded by status/ordering checks, analyses reuse stored results.
+ *
+ * Throw RetryableJobError (or any error) to retry with backoff; throw
+ * PermanentJobError to dead-letter at once.
+ */
+export class RetryableJobError extends Error {}
+export class PermanentJobError extends Error {}
+
+type Handler = (job: Job) => Promise<string | void>;
+
+const str = (job: Job, key: string): string => {
+  const value = job.payload[key];
+  if (typeof value !== "string" || !value) throw new PermanentJobError(`job payload is missing ${key}`);
+  return value;
+};
+
+export const handlers: Record<string, Handler> = {
+  /** GitHub Actions progress -> the lifecycle. Waits for the push by retrying with backoff. */
+  [JOB_TYPES.workflowRun]: async (job) => {
+    const deliveryId = str(job, "deliveryId");
+    const payload = await getDeliveryPayload(deliveryId);
+    if (!payload) return "delivery already processed (payload cleared)";
+    const result = await processWorkflowRun(payload as Parameters<typeof processWorkflowRun>[0], { waitForPush: false });
+    if (result.includes("no deployment recorded") && job.attempts < job.max_attempts) {
+      // The push webhook may not have been processed yet: retry later.
+      throw new RetryableJobError(`deployment not recorded yet (${result})`);
+    }
+    await finishDelivery(deliveryId, result.startsWith("ignored") ? "ignored" : "processed");
+    return result;
+  },
+
+  /** (Re)writes the deployment memory. document_id + replace: idempotent. */
+  [JOB_TYPES.deploymentMemory]: async (job) => {
+    const deployment = await getDeploymentById(str(job, "deploymentId"));
+    if (!deployment) return "deployment no longer exists (purged)";
+    await retain(buildDeploymentMemory(deployment));
+    return `deployment #${deployment.id} memory stored (${deployment.status})`;
+  },
+
+  [JOB_TYPES.incidentMemory]: async (job) => {
+    const deployment = await getDeploymentById(str(job, "deploymentId"));
+    if (!deployment) return "deployment no longer exists (purged)";
+    const incident = await getIncidentForDeployment(deployment.id);
+    if (!incident) return "no incident";
+    await retain(buildIncidentMemory(incident, deployment));
+    return `incident #${incident.id} memory stored`;
+  },
+
+  /** Automatic risk analysis. Transient Gemini failures are retried with backoff (bounded). */
+  [JOB_TYPES.riskAnalyze]: async (job) => {
+    const deploymentId = str(job, "deploymentId");
+    const finalAttempt = job.attempts >= job.max_attempts;
+    const outcome = await runRiskAnalysis(deploymentId, str(job, "attempt"), String(job.payload.trigger ?? "queue"), finalAttempt);
+    if (outcome.retryable && !finalAttempt) {
+      throw new RetryableJobError(`risk analysis temporarily unavailable (${outcome.kind})`);
+    }
+    return outcome.summary;
+  },
+
+  /** Stage 4.1: one bounded re-evaluation of the assessments that used a newly confirmed incident. */
+  [JOB_TYPES.learningReevaluate]: async (job) => {
+    const revision = Number(str(job, "revision"));
+    if (!Number.isInteger(revision) || revision < 1) throw new PermanentJobError("job payload has an invalid revision");
+    return runReevaluation(str(job, "incidentId"), revision);
+  },
+
+  /** Stage 5.2/5.3: re-read .deployguard.yml and CODEOWNERS (default branch). */
+  [JOB_TYPES.repoInputsRefresh]: async (job) => refreshRepositoryInputs(str(job, "githubRepositoryId")),
+
+  /** Stage 5.1: advisory PR check. Payload from the delivery log; idempotent (check run updated, assessment reused). */
+  [JOB_TYPES.pullRequestCheck]: async (job) => {
+    const deliveryId = str(job, "deliveryId");
+    const payload = await getDeliveryPayload(deliveryId);
+    if (!payload) return "delivery already processed (payload cleared)";
+    const result = await processPullRequestEvent(payload as Parameters<typeof processPullRequestEvent>[0]);
+    await finishDelivery(deliveryId, result.startsWith("ignored") ? "ignored" : "processed");
+    return result;
+  },
+
+  /** Stage 5.5: a deployment_status event -> environment of the matching deployment(s). */
+  [JOB_TYPES.deploymentStatus]: async (job) => {
+    const deliveryId = str(job, "deliveryId");
+    const payload = await getDeliveryPayload(deliveryId);
+    if (!payload) return "delivery already processed (payload cleared)";
+    const result = await processDeploymentStatusEvent(payload as Parameters<typeof processDeploymentStatusEvent>[0]);
+    if (result.startsWith("no DeployGuard deployment") && job.attempts < job.max_attempts) {
+      throw new RetryableJobError(result); // the push may not be recorded yet
+    }
+    await finishDelivery(deliveryId, result.startsWith("ignored") ? "ignored" : "processed");
+    return result;
+  },
+
+  /** Stage 5.5: ask the Deployments API about one deployment's commit. */
+  [JOB_TYPES.environmentsSync]: async (job) => syncEnvironments(str(job, "deploymentId")),
+
+  /** Re-reads an installation and its repositories from GitHub (e.g. after unsuspend). */
+  [JOB_TYPES.installationReconcile]: async (job) => {
+    const id = Number(str(job, "installationId"));
+    const result = await reconcileInstallation(id);
+    return `installation ${id}: ${result.status}${result.repositories !== undefined ? `, ${result.repositories} repositories` : ""}`;
+  },
+};

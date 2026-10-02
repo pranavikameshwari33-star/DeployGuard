@@ -1,4 +1,4 @@
-import { env } from "@/lib/env";
+import { env, findServerSecretIn } from "@/lib/env";
 
 /**
  * A tiny client for Gemini's generateContent REST endpoint (Phase 7).
@@ -18,15 +18,18 @@ export type GeminiErrorKind =
   | "timeout"
   | "unavailable"   // network error or 5xx
   | "bad_request"   // 4xx other than the above
-  | "bad_response"; // no usable JSON came back
+  | "bad_response"  // no usable JSON came back
+  | "blocked";      // Stage 1: the request contained a server secret and was not sent
 
 export class GeminiError extends Error {
-  constructor(
-    message: string,
-    readonly kind: GeminiErrorKind,
-    readonly status?: number
-  ) {
+  // Plain fields (not constructor parameter properties) so Node's type
+  // stripping can load this module in the verification scripts.
+  readonly kind: GeminiErrorKind;
+  readonly status?: number;
+  constructor(message: string, kind: GeminiErrorKind, status?: number) {
     super(message);
+    this.kind = kind;
+    this.status = status;
     this.name = "GeminiError";
   }
 }
@@ -65,6 +68,11 @@ export async function generateJson(request: JsonRequest): Promise<GeminiJsonResu
 }
 
 async function generateJsonOnce(request: JsonRequest): Promise<GeminiJsonResult> {
+  // Stage 1 tripwire: never send a server secret to the model, whatever happened upstream.
+  const leaked = findServerSecretIn(`${request.systemInstruction}
+${request.userContent}`);
+  if (leaked) throw new GeminiError(`Request not sent: it contained the value of ${leaked}.`, "blocked");
+
   let apiKey: string;
   try {
     apiKey = env.geminiApiKey();

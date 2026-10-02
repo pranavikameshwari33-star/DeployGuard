@@ -43,6 +43,17 @@ export function buildPushPayload(overrides = {}) {
   };
 }
 
+/**
+ * Real GitHub push payloads always carry the immutable repository id, and since
+ * Stage 1 every memory is scoped by it (ghrepo:<id>). Test repositories get a
+ * stable fake id derived from their full name, in a range (>= 900000000000)
+ * far above real GitHub repository ids, so they can never collide with one.
+ */
+export function testRepositoryId(fullName) {
+  const n = crypto.createHash("sha256").update(fullName).digest().readUInt32BE(0);
+  return 900000000000 + n;
+}
+
 /** Signs a raw body with the webhook secret, producing GitHub's header value. */
 export function signBody(rawBody, secret) {
   return "sha256=" + crypto.createHmac("sha256", secret).update(rawBody, "utf8").digest("hex");
@@ -57,6 +68,9 @@ export function signBody(rawBody, secret) {
  * only on a correctly signed delivery; real GitHub pushes never send it.
  */
 export async function deliver(url, payload, secret, eventType = "push", { autoRisk = false } = {}) {
+  if (payload?.repository?.full_name && typeof payload.repository.id !== "number") {
+    payload.repository.id = testRepositoryId(payload.repository.full_name);
+  }
   const rawBody = JSON.stringify(payload);
   const response = await fetch(url, {
     method: "POST",

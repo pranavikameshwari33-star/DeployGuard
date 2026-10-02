@@ -53,7 +53,18 @@ export type Deployment = {
   repository_id: string | null;
   /** Phase 9: GitHub's immutable repository id from the push payload. */
   github_repository_id: string | null;
+  /** Stage 1: what kind of content was redacted from this record (counts/categories, never values). */
+  redaction: DeploymentRedaction | null;
+  /** Stage 2: GitHub time of the newest pipeline event applied (ordering guard). */
+  ci_last_event_at: Date | null;
+  /** Stage 5: which .deployguard.yml shaped the analysis; environment lookup state. */
+  analysis_config: { status: string; sha: string | null } | null;
+  environments_status: "found" | "none" | "unavailable" | null;
+  environments_checked_at: Date | null;
 };
+
+export type RedactionCount = { count: number; categories: string[] };
+export type DeploymentRedaction = { commit_message?: RedactionCount; failure_output?: RedactionCount };
 
 export type RiskAnalysisStatus = "pending" | "completed" | "unavailable";
 
@@ -69,7 +80,8 @@ const COLUMNS = `
   updated_at, ci_run_id, ci_run_url, ci_started_at, ci_finished_at,
   failure_stage, failure_job, failure_message, file_analysis, change_categories,
   affected_services, risk_analysis_status, risk_analysis_error, risk_analysis_updated_at,
-  repository_id, github_repository_id
+  repository_id, github_repository_id, redaction, ci_last_event_at, analysis_config,
+  environments_status, environments_checked_at
 `;
 
 /**
@@ -91,7 +103,9 @@ export async function insertDeployment(
   event: PushEvent,
   analysis: ChangeAnalysis,
   /** Phase 9: the connected repository this push belongs to; null for an unowned (plain webhook) push. */
-  repositoryId: string | null = null
+  repositoryId: string | null = null,
+  /** Stage 5: which .deployguard.yml shaped the analysis ({ status, sha }), or null. */
+  analysisConfig: { status: string; sha: string | null } | null = null
 ): Promise<InsertResult> {
   const pool = getPool();
 
@@ -100,10 +114,11 @@ export async function insertDeployment(
        repository, owner, branch, commit_sha, commit_message, author,
        changed_files, added_files, modified_files, deleted_files, status,
        file_analysis, change_categories, affected_services,
-       repository_id, github_repository_id
+       repository_id, github_repository_id, redaction, analysis_config
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'RECEIVED', $11::jsonb, $12, $13, $14, $15)
-     ON CONFLICT (owner, repository, branch, commit_sha) DO NOTHING
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'RECEIVED', $11::jsonb, $12, $13, $14, $15, $16::jsonb, $17::jsonb)
+     -- Either unique key (name-based, or Stage 2 repository-id-based) means "already recorded".
+     ON CONFLICT DO NOTHING
      RETURNING ${COLUMNS}`,
     [
       event.repository,
@@ -121,6 +136,8 @@ export async function insertDeployment(
       analysis.services,
       repositoryId,
       event.githubRepositoryId,
+      event.commitMessageRedaction?.count ? JSON.stringify({ commit_message: event.commitMessageRedaction }) : null,
+      analysisConfig ? JSON.stringify(analysisConfig) : null,
     ]
   );
 
@@ -135,7 +152,8 @@ export async function insertDeployment(
     `UPDATE deployments SET
        repository_id        = COALESCE(repository_id, $5),
        github_repository_id = COALESCE(github_repository_id, $6)
-     WHERE owner = $1 AND repository = $2 AND branch = $3 AND commit_sha = $4
+     WHERE (owner = $1 AND repository = $2 AND branch = $3 AND commit_sha = $4)
+        OR (github_repository_id = $6 AND branch = $3 AND commit_sha = $4)
      RETURNING ${COLUMNS}`,
     [event.owner, event.repository, event.branch, event.commitSha, repositoryId, event.githubRepositoryId]
   );
@@ -180,6 +198,25 @@ export async function startRiskAnalysis(deploymentId: string): Promise<string> {
 }
 
 /**
+ * Stage 2: the in-flight lock for a user's Re-analyze. Atomically starts an
+ * attempt ONLY if no other attempt started within `lockSeconds`; returns null
+ * when one is already running, so two clicks never make two Gemini calls.
+ */
+export async function tryStartRiskAnalysis(deploymentId: string, lockSeconds = 180): Promise<string | null> {
+  const attempt = crypto.randomUUID();
+  const result = await getPool().query(
+    `UPDATE deployments
+     SET risk_analysis_status = 'pending', risk_analysis_error = NULL,
+         risk_analysis_updated_at = now(), risk_analysis_attempt = $2
+     WHERE id = $1
+       -- COALESCE: a never-analysed row has NULL status, and NOT (NULL ...) would be NULL (= refuse).
+       AND NOT COALESCE(risk_analysis_status = 'pending' AND risk_analysis_updated_at > now() - make_interval(secs => $3), false)`,
+    [deploymentId, attempt, lockSeconds]
+  );
+  return (result.rowCount ?? 0) > 0 ? attempt : null;
+}
+
+/**
  * Records how an attempt ended -- unless a newer attempt has started since, in
  * which case this (older) outcome is dropped and the newer one will report.
  */
@@ -205,6 +242,11 @@ export async function listStuckRiskAnalyses(olderThanMinutes: number, limit: num
   const result = await getPool().query<{ id: string }>(
     `SELECT id FROM deployments
      WHERE risk_analysis_status = 'pending' AND risk_analysis_updated_at < now() - make_interval(mins => $1)
+       -- Stage 2: a job still queued/running (e.g. waiting for a retry) is not stuck.
+       AND NOT EXISTS (
+         SELECT 1 FROM jobs j
+         WHERE j.type = 'risk.analyze' AND j.payload->>'deploymentId' = deployments.id::text
+           AND j.status IN ('queued', 'running'))
      ORDER BY risk_analysis_updated_at LIMIT $2`,
     [olderThanMinutes, limit]
   );
@@ -259,6 +301,16 @@ export type HistoricalDeployment = Deployment & {
   incident_error_message: string | null;
   incident_root_cause: string | null;
   incident_resolution: string | null;
+  /** Stage 4: confirmation, flake and revert facts. */
+  incident_affected_service: string | null;
+  incident_downstream_effect: string | null;
+  incident_confirmed_revision: number | null;
+  incident_confirmed_at: Date | null;
+  incident_flake_status: string | null;
+  reverted_by_deployment_id: string | null;
+  reverted_hours_after: string | null;
+  /** Stage 5.5: GitHub deployment environments of this commit. */
+  environment_list: { name: string; state: string | null }[];
 };
 
 /**
@@ -282,9 +334,23 @@ export async function findHistoryCandidates(
             i.failure_type  AS incident_failure_type,
             i.error_message AS incident_error_message,
             i.root_cause    AS incident_root_cause,
-            i.resolution    AS incident_resolution
+            i.resolution    AS incident_resolution,
+            i.affected_service   AS incident_affected_service,
+            i.downstream_effect  AS incident_downstream_effect,
+            i.confirmed_revision AS incident_confirmed_revision,
+            i.confirmed_at       AS incident_confirmed_at,
+            i.flake_status       AS incident_flake_status,
+            rv.reverting_deployment_id::text AS reverted_by_deployment_id,
+            rv.hours_after::text AS reverted_hours_after,
+            (SELECT COALESCE(json_agg(json_build_object('name', e.environment, 'state', e.state) ORDER BY e.environment), '[]'::json)
+             FROM deployment_environments e WHERE e.deployment_id = d.id) AS environment_list
      FROM deployments d
      LEFT JOIN incidents i ON i.deployment_id = d.id
+     -- Stage 4.5: the first observed revert of this deployment, if any.
+     LEFT JOIN LATERAL (
+       SELECT r.reverting_deployment_id, r.hours_after FROM deployment_reverts r
+       WHERE r.reverted_deployment_id = d.id ORDER BY r.detected_at LIMIT 1
+     ) rv ON true
      WHERE d.owner = $1 AND d.repository = $2
        -- Phase 9: history never crosses an ownership boundary. An owned
        -- deployment only sees deployments of the SAME connected repository;
@@ -346,12 +412,22 @@ export type StatusUpdate = {
   ciRunId?: string;
   ciRunUrl?: string;
   failure?: { stage?: string; job?: string; message?: string };
+  /** Stage 1: set by the lifecycle when the failure output had something masked. */
+  failureRedaction?: RedactionCount;
+  /**
+   * Stage 2: when GitHub says this state happened (workflow_run updated_at).
+   * An event OLDER than the newest one already applied is ignored, so a late
+   * "in progress" can never overwrite SUCCESS/FAILED. Reports without a time
+   * (the CI reporter) count as "now".
+   */
+  eventAt?: string;
 };
 
 export type UpdateResult =
   | { outcome: "updated"; deployment: Deployment; previousStatus: DeploymentStatus }
   | { outcome: "not_found" }
-  | { outcome: "invalid_transition"; currentStatus: DeploymentStatus };
+  | { outcome: "invalid_transition"; currentStatus: DeploymentStatus }
+  | { outcome: "stale_event"; currentStatus: DeploymentStatus };
 
 /**
  * Moves an EXISTING deployment to a new pipeline status. Never inserts: the row
@@ -385,9 +461,16 @@ export async function updateDeploymentStatus(
        ci_finished_at  = CASE WHEN $5::text = 'BUILDING' THEN NULL ELSE now() END,
        failure_stage   = $9,
        failure_job     = $10,
-       failure_message = $11
+       failure_message = $11,
+       redaction       = CASE WHEN $12::jsonb IS NULL THEN d.redaction
+                              ELSE COALESCE(d.redaction, '{}'::jsonb) || $12::jsonb END,
+       ci_last_event_at = GREATEST(d.ci_last_event_at, COALESCE($13::timestamptz, now()))
      FROM prev
      WHERE d.id = prev.id AND prev.status = ANY($6::text[])
+       -- Stage 2 ordering: only newer events (a repeat of the same state at the same time is harmless).
+       AND (d.ci_last_event_at IS NULL
+            OR COALESCE($13::timestamptz, now()) > d.ci_last_event_at
+            OR (COALESCE($13::timestamptz, now()) = d.ci_last_event_at AND prev.status = $5::text))
      RETURNING d.*, prev.status AS previous_status`,
     [
       key.owner,
@@ -401,6 +484,8 @@ export async function updateDeploymentStatus(
       isFailed ? update.failure?.stage ?? null : null,
       isFailed ? update.failure?.job ?? null : null,
       isFailed ? update.failure?.message ?? null : null,
+      isFailed && update.failureRedaction?.count ? JSON.stringify({ failure_output: update.failureRedaction }) : null,
+      update.eventAt ?? null,
     ]
   );
 
@@ -417,7 +502,10 @@ export async function updateDeploymentStatus(
     [key.owner, key.repository, key.branch, key.commitSha]
   );
 
-  return existing.rows.length === 0
-    ? { outcome: "not_found" }
-    : { outcome: "invalid_transition", currentStatus: existing.rows[0].status };
+  if (existing.rows.length === 0) return { outcome: "not_found" };
+  const currentStatus = existing.rows[0].status;
+  // Allowed move, but refused by the ordering check: an out-of-date event.
+  return ALLOWED_FROM[update.status].includes(currentStatus)
+    ? { outcome: "stale_event", currentStatus }
+    : { outcome: "invalid_transition", currentStatus };
 }

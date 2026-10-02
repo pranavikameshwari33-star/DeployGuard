@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { listDeployments } from "@/lib/db/deployments";
 import { buildDeploymentMemory } from "@/lib/hindsight/deployment-memory";
 import { retain } from "@/lib/hindsight/client";
-import { getViewer } from "@/lib/auth/session";
+import { errorDetail, getViewer } from "@/lib/auth/session";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,14 +18,14 @@ export const dynamic = "force-dynamic";
  * `update_mode: "replace"`, so a deployment that already has a memory gets it
  * overwritten with identical content rather than duplicated.
  *
- *   curl -X POST -H "Authorization: Bearer $DEPLOYGUARD_STATUS_TOKEN" http://localhost:3000/api/memory/backfill
+ *   curl -X POST -H "Authorization: Bearer $DEPLOYGUARD_INTERNAL_TOKEN" http://localhost:3000/api/memory/backfill
  */
 export async function POST(request: Request) {
   // Phase 9: a maintenance tool that rewrites memories for ALL deployments, so
-  // only internal tooling may call it (Bearer DEPLOYGUARD_STATUS_TOKEN).
+  // only internal tooling may call it (Bearer DEPLOYGUARD_INTERNAL_TOKEN).
   const viewer = await getViewer();
   if (viewer?.kind !== "internal") {
-    return NextResponse.json({ error: "Internal tooling only (Bearer DEPLOYGUARD_STATUS_TOKEN)." }, { status: 401 });
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
 
   const limitParam = new URL(request.url).searchParams.get("limit");
@@ -36,20 +36,20 @@ export async function POST(request: Request) {
     deployments = await listDeployments(limit);
   } catch (error) {
     return NextResponse.json(
-      { error: "Could not read deployments from the database.", detail: (error as Error).message },
+      { error: "Could not read deployments from the database.", ...errorDetail(viewer, (error as Error).message) },
       { status: 500 }
     );
   }
 
   const restored: string[] = [];
-  const failed: { deploymentId: string; error: string }[] = [];
+  const failed: { deploymentId: string; errorRef: string }[] = [];
 
   for (const deployment of deployments) {
     try {
       await retain(buildDeploymentMemory(deployment));
       restored.push(deployment.id);
     } catch (error) {
-      failed.push({ deploymentId: deployment.id, error: (error as Error).message });
+      failed.push({ deploymentId: deployment.id, ...errorDetail(viewer, (error as Error).message) });
     }
   }
 

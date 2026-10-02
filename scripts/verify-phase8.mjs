@@ -217,7 +217,9 @@ try {
     check(geminiLinesAfter === geminiLinesBefore, "no risk/Gemini activity in the server log during the loads");
   }
   check(
-    page.ok && ["Current deployment", "Deployment risk", "Change analysis", "Historical evidence", "Pipeline", "Deployment history", "Incident history"].every((s) => html.includes(s)),
+    page.ok && // Stage 3 renamed two sections: "Deployment risk" -> "Why this risk?" (the evidence
+    // trace) and "Deployment history" -> "Deployment and risk history".
+    ["Current deployment", "Why this risk?", "Change analysis", "Historical evidence", "Pipeline", "Deployment and risk history", "Incident history"].every((s) => html.includes(s)),
     "page renders every dashboard section"
   );
   const cssLinks = [...html.matchAll(/href="(\/_next\/static\/[^"]+\.css)"/g)].map((m) => m[1]);

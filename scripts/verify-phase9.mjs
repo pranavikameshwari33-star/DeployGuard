@@ -229,7 +229,8 @@ try {
   check(afterUninstall[0]?.connected === false, "uninstalling disconnects the repository");
   const ignored = await appPush(userA, "push after uninstall");
   check(ignored.result.body?.ignored && !(await statusOf(ignored.payload.after)), "pushes after uninstall are not recorded", ignored.result.body?.ignored);
-  const logout = await as(userA)("/auth/logout", { method: "POST" });
+  // A browser form POST always carries Origin (Stage 1 CSRF check requires it).
+  const logout = await as(userA)("/auth/logout", { method: "POST", headers: { Origin: BASE } });
   check(logout.status === 303 && /dg_session=;/.test(logout.headers.get("set-cookie") ?? ""), "logout redirects and clears the cookie");
   check((await as(userA)("/api/deployments")).status === 401, "the old session no longer works");
 

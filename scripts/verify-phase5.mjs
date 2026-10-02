@@ -20,6 +20,7 @@
 import assert from "node:assert/strict";
 import pg from "pg";
 import { loadEnv } from "./load-env.mjs";
+import { waitForJob } from "./job-helpers.mjs";
 import { internalFetch } from "./internal-fetch.mjs";
 import { buildPushPayload, deliver } from "./test-payload.mjs";
 import { analyzeChanges, classifyFile } from "../lib/analysis/change-analysis.ts";
@@ -56,10 +57,10 @@ const same = (a, b) => {
   }
 };
 
-/** [path, expected categories (canonical order), expected service or null] */
+/** [path, expected categories (canonical order), expected service or null]. Stage 5 added the finer categories. */
 const EXAMPLES = [
   ["README.md", ["documentation"], null],
-  ["package.json", ["dependencies"], null],
+  ["package.json", ["dependencies", "dependency_manifest"], null],
   ["config/database.yaml", ["database", "configuration"], "database"],
   ["src/auth/login.ts", ["application_code", "authentication"], null],
   ["payment-service/checkout.ts", ["application_code", "payments"], "payment-service"],
@@ -70,12 +71,12 @@ const EXAMPLES = [
   ["services/auth/login.ts", ["application_code", "authentication"], "auth"],
   ["frontend/components/Login.tsx", ["application_code", "authentication"], "frontend"],
   ["app/api/deployments/status/route.ts", ["application_code", "api"], null],
-  ["db/migrations/001_deployments.sql", ["database"], "database"],
-  ["k8s/deployment.yaml", ["infrastructure"], null],
-  ["terraform/main.tf", ["infrastructure"], null],
-  ["Dockerfile", ["infrastructure"], null],
-  ["docker-compose.yml", ["infrastructure"], null],
-  [".env.example", ["configuration"], null],
+  ["db/migrations/001_deployments.sql", ["database", "migration"], "database"],
+  ["k8s/deployment.yaml", ["infrastructure", "iac"], null],
+  ["terraform/main.tf", ["infrastructure", "iac"], null],
+  ["Dockerfile", ["infrastructure", "container"], null],
+  ["docker-compose.yml", ["infrastructure", "container"], null],
+  [".env.example", ["configuration", "environment"], null],
   ["next.config.ts", ["configuration"], null],
 ];
 
@@ -199,10 +200,12 @@ try {
   );
 
   console.log("\n6. Hindsight memory");
+  // Stage 2: the Hindsight write is a queued job (not inside the webhook request).
+  const memoryJob = await waitForJob(client, first.body.memory?.jobId);
   check(
-    first.body.memory?.stored === true,
-    "deployment memory (with analysis) written",
-    first.body.memory?.stored ? "" : first.body.memory?.error ?? "unknown reason"
+    first.body.memory?.queued === true && memoryJob?.status === "succeeded",
+    "deployment memory (with analysis) written (queued job succeeded)",
+    `queued=${first.body.memory?.queued}, job=${memoryJob?.status ?? "timeout"} ${memoryJob?.last_error ?? ""}`
   );
 
   const shortSha = payload.after.slice(0, 7);

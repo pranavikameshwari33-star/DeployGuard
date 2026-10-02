@@ -7,6 +7,7 @@ import {
 } from "@/lib/db/deployments";
 import { getIncidentForDeployment } from "@/lib/db/incidents";
 import { recall } from "@/lib/hindsight/client";
+import type { EnvironmentFacts } from "@/lib/db/environments";
 import {
   DEFAULT_MIN_SCORE,
   SIMILARITY_WEIGHTS,
@@ -51,9 +52,20 @@ export type HistoricalEvidence = {
     id: string;
     failure_type: string;
     error_message: string | null;
+    /** NULL = not known. Non-null only when HUMAN-CONFIRMED (Stage 4.1). */
     root_cause: string | null;
     resolution: string | null;
+    affected_service: string | null;
+    downstream_effect: string | null;
+    provenance: "HUMAN-CONFIRMED" | "NOT DETERMINED";
+    confirmed_at: string | null;
+    /** Stage 4.4: a re-run of the same commit passed. */
+    probable_flake: boolean;
   } | null;
+  /** Stage 4.5: observed revert of this deployment by a later one. */
+  reverted_by: { deployment_id: string; hours_after: number } | null;
+  /** Stage 5.5: GitHub deployment environments of this deployment ("unknown" unless found). */
+  environments: EnvironmentFacts;
   similarity_score: number;
   relevance: "strong" | "weak";
   matched_signals: MatchedSignal[];
@@ -96,6 +108,15 @@ export async function findSimilarDeployments(
 ): Promise<SimilarityResult | null> {
   const current = await getDeploymentById(deploymentId);
   if (!current) return null;
+  return findSimilarFor(current, options);
+}
+
+/**
+ * Stage 5: the same search for any change shaped like a deployment row -- a
+ * recorded deployment, or a pull request's files (id "0", never stored), so
+ * PR checks use exactly the same similarity rules and tenant boundary.
+ */
+export async function findSimilarFor(current: Deployment, options: SimilarityOptions = {}): Promise<SimilarityResult> {
 
   const minScore = options.minScore ?? DEFAULT_MIN_SCORE;
   const limit = options.limit ?? 10;
@@ -106,22 +127,18 @@ export async function findSimilarDeployments(
   // --- 1. Hindsight: which past deployments does memory associate with this change?
   const recalled = new Map<string, string[]>();
   let hindsight: SimilarityResult["hindsight"];
-  // Phase 9: an owned deployment recalls only memories tagged with its own
-  // immutable GitHub repository id; an unowned one keeps the name tag (as before).
-  const scopeTags = current.repository_id
-    ? current.github_repository_id
-      ? [`ghrepo:${current.github_repository_id}`]
-      : null
-    : [`repo:${repo}`];
+  // Phase 9 / Stage 1: recall is scoped to the deployment's own immutable GitHub
+  // repository id -- owned or not. The mutable repo:<name> tag is no longer a
+  // scope; without a repository id there is no recall (the client refuses it).
+  const scopeRepoIds = current.github_repository_id ? [current.github_repository_id] : null;
   if (options.useHindsight === false) {
     hindsight = { used: false, error: "disabled by request" };
-  } else if (!scopeTags) {
+  } else if (!scopeRepoIds) {
     hindsight = { used: false, error: "no repository scope available for memory recall" };
   } else {
     try {
       const { results } = await recall(buildRecallQuery(repo, current, currentAnalysis), {
-        tags: scopeTags,
-        tagsMatch: "any_strict",
+        githubRepositoryIds: scopeRepoIds,
       });
       for (const memory of results ?? []) {
         const id = memory.metadata?.deployment_id;
@@ -153,9 +170,12 @@ export async function findSimilarDeployments(
     if (row.id === current.id || byId.has(row.id)) continue;
     const analysis = analysisOf(row);
     const wasRecalled = recalled.has(row.id);
+    // Stage 4.4: a probable flake's failure type is noise, so it earns no
+    // same_failure_type points (the deployment itself still matches on its files).
+    const flaky = row.incident_flake_status === "probable_flake";
     const { score, relevance, signals } = scoreSimilarity(
       currentComparable,
-      comparable(row, analysis, row.incident_failure_type),
+      comparable(row, analysis, flaky ? null : row.incident_failure_type),
       { recalledByHindsight: wasRecalled, minScore }
     );
     if (relevance === "not_relevant") continue;
@@ -180,9 +200,21 @@ export async function findSimilarDeployments(
             id: row.incident_id,
             failure_type: row.incident_failure_type ?? "unknown_failure",
             error_message: tail(row.incident_error_message),
-            root_cause: row.incident_root_cause,
-            resolution: row.incident_resolution,
+            root_cause: confirmed(row) ? row.incident_root_cause : null,
+            resolution: confirmed(row) ? row.incident_resolution : null,
+            affected_service: confirmed(row) ? row.incident_affected_service : null,
+            downstream_effect: confirmed(row) ? row.incident_downstream_effect : null,
+            provenance: confirmed(row) ? "HUMAN-CONFIRMED" : "NOT DETERMINED",
+            confirmed_at: confirmed(row) ? row.incident_confirmed_at?.toISOString() ?? null : null,
+            probable_flake: flaky,
           }
+        : null,
+      environments: {
+        status: row.environment_list?.length ? "found" : row.environments_status,
+        environments: (row.environment_list ?? []).map((e) => ({ name: e.name, state: e.state, at: null })),
+      },
+      reverted_by: row.reverted_by_deployment_id
+        ? { deployment_id: row.reverted_by_deployment_id, hours_after: Number(row.reverted_hours_after) }
         : null,
       similarity_score: score,
       relevance,
@@ -250,6 +282,11 @@ function buildRecallQuery(repo: string, d: Deployment, analysis: ChangeAnalysis)
     `in categories ${analysis.categories.join(", ") || "none"}, affecting ${services}. ` +
     `What happened to them, did they fail, and what failure was observed?`
   );
+}
+
+/** Stage 4.1: the cause fields count only when a person confirmed them. */
+function confirmed(row: { incident_confirmed_revision: number | null }): boolean {
+  return row.incident_confirmed_revision !== null;
 }
 
 /** Keep the end of long output: that is where a failing command reports its error. */

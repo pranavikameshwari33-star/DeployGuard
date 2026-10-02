@@ -12,10 +12,12 @@ import {
 } from "@/lib/db/accounts";
 import { deploymentExists, type Deployment, type PipelineStatus, type StatusUpdate } from "@/lib/db/deployments";
 import { forgetInstallationToken, getCommit, installationGet, installationGetText } from "@/lib/github/app";
-import { reconcileInstallation } from "@/lib/github/installations";
 import type { PushEvent } from "@/lib/github/parse-push-event";
 import { applyPipelineStatus } from "@/lib/pipeline/apply-status";
 import { ingestPush } from "@/lib/pipeline/ingest-push";
+import { enqueue } from "@/lib/jobs/queue";
+import { aggregateRuns, FAILED_CONCLUSIONS } from "@/lib/github/aggregate-runs";
+import { JOB_TYPES } from "@/lib/jobs/types";
 
 /**
  * Phase 9: the GitHub App events the existing webhook endpoint now understands.
@@ -86,10 +88,11 @@ export async function handleInstallationEvent(payload: {
     case "unsuspend": {
       // Phase 10: resume only for what is authorised NOW -- re-read the
       // installation and its repository list from GitHub before monitoring again.
+      // Stage 2: the GitHub API calls run as a queued job, not inside the webhook request.
       await upsertInstallation(installationInfo(installation), { status: "active" });
-      const result = await reconcileInstallation(id);
-      console.log(`[DeployGuard][github] Installation ${id} reactivated (${result.repositories ?? "?"} repositories${result.note ? `; ${result.note}` : ""}).`);
-      return "installation reactivated and resynchronised";
+      await enqueue(JOB_TYPES.installationReconcile, { installationId: String(id) }, { dedupeKey: `reconcile:${id}:${Date.now()}` });
+      console.log(`[DeployGuard][github] Installation ${id} reactivated; repository resync queued.`);
+      return "installation reactivated; resynchronisation queued";
     }
     default: {
       // created, new_permissions_accepted, ...
@@ -191,6 +194,9 @@ type WorkflowRun = {
   conclusion: string | null;
   event?: string;
   html_url?: string;
+  /** Stage 2: GitHub's timestamp of this state of the run, used to ignore out-of-order events. */
+  updated_at?: string;
+  run_attempt?: number;
 };
 
 type WorkflowRunPayload = {
@@ -201,8 +207,6 @@ type WorkflowRunPayload = {
 };
 
 /** Conclusions that mean the pipeline failed. cancelled / skipped / neutral are not failures. */
-const FAILED_CONCLUSIONS = new Set(["failure", "timed_out", "startup_failure"]);
-const OK_CONCLUSIONS = new Set(["success", "skipped", "neutral"]);
 
 const LOG_TAIL_LINES = 40;
 const MAX_FAILURE_MESSAGE = 4000;
@@ -219,7 +223,10 @@ const RETRY_DELAY_MS = 5000;
  * push-triggered runs for the commit before deciding. Runs triggered by pull
  * requests, schedules etc. are not deployments and are ignored.
  */
-export async function processWorkflowRun(payload: WorkflowRunPayload): Promise<string> {
+export async function processWorkflowRun(
+  payload: WorkflowRunPayload,
+  options: { waitForPush?: boolean } = {}
+): Promise<string> {
   const run = payload.workflow_run;
   const repo = payload.repository;
   const installationId = payload.installation?.id;
@@ -232,9 +239,10 @@ export async function processWorkflowRun(payload: WorkflowRunPayload): Promise<s
 
   let update: StatusUpdate | null;
   if (payload.action === "requested" || payload.action === "in_progress") {
-    update = { status: "BUILDING", ciRunId: String(run.id), ciRunUrl: run.html_url };
+    update = { status: "BUILDING", ciRunId: String(run.id), ciRunUrl: run.html_url, eventAt: run.updated_at };
   } else if (payload.action === "completed") {
     update = await completedUpdate(installationId, repo.full_name, run);
+    if (update) update.eventAt = run.updated_at;
   } else {
     return `ignored: action ${payload.action}`;
   }
@@ -247,11 +255,13 @@ export async function processWorkflowRun(payload: WorkflowRunPayload): Promise<s
     commitSha: run.head_sha.toLowerCase(),
   };
 
-  // The workflow can start before the push webhook has been processed; retry briefly.
-  for (let attempt = 1; attempt <= NOT_FOUND_RETRIES; attempt++) {
+  // The workflow can start before the push webhook has been processed. Inline
+  // callers wait briefly; the job queue (Stage 2) instead retries with backoff.
+  const tries = options.waitForPush === false ? 1 : NOT_FOUND_RETRIES;
+  for (let attempt = 1; attempt <= tries; attempt++) {
     const result = await applyPipelineStatus(key, update, "actions");
     if (result.outcome !== "not_found") return `${update.status}: ${result.outcome}`;
-    if (attempt < NOT_FOUND_RETRIES) await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+    if (attempt < tries) await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
   }
   return `${update.status}: no deployment recorded for this push`;
 }
@@ -272,20 +282,20 @@ async function completedUpdate(installationId: number, fullName: string, run: Wo
     );
   }
 
-  const failed = runs.find((r) => r.status === "completed" && FAILED_CONCLUSIONS.has(r.conclusion ?? ""));
-  if (failed) {
+  // Stage 2: the aggregation rule lives in lib/github/aggregate-runs.ts (unit-tested).
+  const result = aggregateRuns(runs);
+  if (result.outcome === "FAILED") {
     return {
       status: "FAILED",
-      ciRunId: String(failed.id),
-      ciRunUrl: failed.html_url,
-      failure: await failureDetails(installationId, fullName, failed),
+      ciRunId: String(result.run.id),
+      ciRunUrl: result.run.html_url,
+      failure: await failureDetails(installationId, fullName, result.run),
     };
   }
-  if (runs.some((r) => r.status !== "completed")) return null; // other workflows still running: stay BUILDING
-  if (runs.every((r) => OK_CONCLUSIONS.has(r.conclusion ?? "")) && runs.some((r) => r.conclusion === "success")) {
+  if (result.outcome === "SUCCESS") {
     return { status: "SUCCESS" as PipelineStatus, ciRunId: String(run.id), ciRunUrl: run.html_url };
   }
-  return null; // e.g. all cancelled: no outcome to record
+  return null; // BUILDING: other workflows still running; NONE: e.g. all cancelled
 }
 
 type Job = {

@@ -73,6 +73,9 @@ export type PushEvent = {
   /** Phase 9: GitHub's immutable repository id, and the App installation that delivered the push (null for a plain repo webhook). */
   githubRepositoryId: number | null;
   installationId: number | null;
+
+  /** Stage 1: set by redactPushEvent when the commit message had something masked (counts only). */
+  commitMessageRedaction?: { count: number; categories: string[] };
 };
 
 /**

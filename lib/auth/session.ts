@@ -1,16 +1,19 @@
+import crypto from "node:crypto";
 import { cookies, headers } from "next/headers";
 import { isAuthorized } from "@/lib/auth/bearer-token";
 import { getSessionUser, listUserRepositories, type User, type UserRepository } from "@/lib/db/accounts";
 import { env } from "@/lib/env";
+import { redactText } from "@/lib/security/redact";
 
 /**
  * Phase 9: who is making this request?
  *
  *   user      -- a signed-in browser session. Sees ONLY deployments of the
  *                repositories their GitHub App installations granted.
- *   internal  -- DeployGuard's own tooling (CI reporter, verification scripts)
- *                presenting the existing DEPLOYGUARD_STATUS_TOKEN as a Bearer
- *                token. Unscoped, as every endpoint was before Phase 9.
+ *   internal  -- DeployGuard's own tooling (maintenance schedule, verification
+ *                scripts) presenting DEPLOYGUARD_INTERNAL_TOKEN as a Bearer
+ *                token. Unscoped. Stage 1: the CI STATUS token is NOT accepted
+ *                here; it only works on POST /api/deployments/status.
  *   null      -- anonymous: protected endpoints answer 401, pages redirect to /login.
  *
  * The session cookie holds a random token; the database stores only its hash
@@ -42,7 +45,7 @@ export async function getViewer(): Promise<Viewer | null> {
   if (authorization) {
     let expected: string | null = null;
     try {
-      expected = env.deployguardStatusToken();
+      expected = env.deployguardInternalToken();
     } catch {
       expected = null;
     }
@@ -66,12 +69,20 @@ export function scopeOf(viewer: Viewer): DataScope {
 }
 
 /**
- * Internal error text (database, Hindsight, GitHub messages) is only returned to
- * internal tooling. Signed-in users get the generic error; the detail stays in
- * the server log. Prevents host names or internal state leaking to browsers.
+ * Stage 1: error detail (database, Hindsight, GitHub messages) is NEVER sent to
+ * a client -- not even internal tooling, whose output can end up in CI logs.
+ * The detail is logged server-side with a short random reference, and only
+ * the reference is returned, so an operator can find the log line.
  */
-export function errorDetail(viewer: Viewer | null, message: string): { detail?: string } {
-  return viewer?.kind === "internal" ? { detail: message } : {};
+export function errorDetail(_viewer: Viewer | null, message: string): { errorRef: string } {
+  return { errorRef: logErrorRef(message) };
+}
+
+/** Logs an internal error message under a fresh reference and returns the reference. */
+export function logErrorRef(message: string, area = "error"): string {
+  const ref = crypto.randomBytes(4).toString("hex");
+  console.error(`[DeployGuard][${area}] ref=${ref}: ${redactText(message)}`);
+  return ref;
 }
 
 /** Server-side ownership check for a single deployment. Unowned rows are internal-only. */

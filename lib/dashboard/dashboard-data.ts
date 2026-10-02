@@ -1,13 +1,15 @@
 import type { FileAnalysis } from "@/lib/analysis/change-analysis";
+import { redactDeep, redactNullable, redactText } from "@/lib/security/redact";
+import { safeGithubUrl } from "@/lib/security/untrusted";
 import {
   getDeploymentById,
-  listDeployments,
   type Deployment,
   type DeploymentScope,
   type DeploymentStatus,
   type RiskAnalysisStatus,
 } from "@/lib/db/deployments";
-import { getIncidentForDeployment, listIncidents, type Incident, type IncidentListItem } from "@/lib/db/incidents";
+import { getIncidentForDeployment, type Incident, type IncidentListItem } from "@/lib/db/incidents";
+import { historyCounts, listDeploymentsPage, listIncidentsScoped, type HistoryCounts, type ViewScope } from "@/lib/dashboard/queries";
 import {
   getLatestAssessment,
   getLatestRiskLevels,
@@ -16,6 +18,21 @@ import {
 import { toEvidenceMatch } from "@/lib/risk/evidence";
 import type { EvidenceMatch, RiskLevel } from "@/lib/risk/validate";
 import { findSimilarDeployments } from "@/lib/similarity/find-similar";
+import { getPool } from "@/lib/db/client";
+import { getEnvironments, type EnvironmentFacts } from "@/lib/db/environments";
+import { ownersOfFiles } from "@/lib/config/codeowners";
+import type { RepoConfig } from "@/lib/config/repo-config";
+import { getRepositoryInputs, type RepositoryInputs } from "@/lib/github/repo-inputs";
+import {
+  findFailurePatterns,
+  flakyDeploymentIds,
+  getAccuracyRecord,
+  getRevertFacts,
+  revertedDeploymentIds,
+  type AccuracyRecord,
+  type FailurePattern,
+  type RevertFacts,
+} from "@/lib/db/learning";
 
 /**
  * Phase 8: everything the dashboard shows, read in one place.
@@ -28,6 +45,8 @@ import { findSimilarDeployments } from "@/lib/similarity/find-similar";
 export type DashboardDeployment = {
   id: string;
   repository: string;
+  /** Stage 3: the immutable GitHub repository id (switcher context, connection state). */
+  github_repository_id: string | null;
   branch: string;
   commit_sha: string;
   commit_message: string;
@@ -57,18 +76,72 @@ export type RiskView =
       note: string | null;
     }
   | { state: "pending" }
-  | { state: "unavailable"; error: string | null }
+  | { state: "unavailable"; error: string | null; kind: UnavailableKind }
   | { state: "not_analysed" };
+
+/** Stage 3: why an analysis is unavailable, in words a user can act on. */
+export type UnavailableKind = "usage_limit" | "invalid_answer" | "model_unavailable" | "other";
+
+export function unavailableKind(error: string | null): UnavailableKind {
+  if (!error) return "other";
+  if (/usage limit/i.test(error)) return "usage_limit";
+  if (/failed validation|not valid JSON|no output/i.test(error)) return "invalid_answer";
+  if (/gemini|could not reach|did not answer|timeout|responded 5dd|rate/i.test(error)) return "model_unavailable";
+  return "other";
+}
 
 export type SelectedDeployment = {
   deployment: DashboardDeployment;
   risk: RiskView;
+  /**
+   * Stage 3: whether to OFFER Re-analyze. Only when the result is missing,
+   * unavailable or older than the current pipeline state, and the change
+   * analysis exists (there is evidence to analyse). Never automatic.
+   */
+  reanalyze: { offered: boolean; why: string };
   incident: Incident | null;
+  /** Stage 4.5: observed reverts of / by this deployment. */
+  reverts: RevertFacts;
+  /** Stage 5: repository inputs, code owners of the changed files, environments, recent PR checks. */
+  inputs: InputsView;
+  owners: OwnersView;
+  environments: EnvironmentFacts;
+  prChecks: PullRequestCheckRow[];
   evidence: {
     /** "assessment": exactly what the risk analysis saw. "database": current structured matches (no analysis yet). */
     source: "assessment" | "database";
     matches: EvidenceMatch[];
   };
+};
+
+/** Stage 5.2: what the dashboard says about .deployguard.yml and CODEOWNERS (no raw file content). */
+export type InputsView = {
+  configStatus: "absent" | "valid" | "invalid" | "unavailable" | "not_read";
+  configErrors: string[];
+  config: RepoConfig | null;
+  fetchedAt: string | null;
+  /** The config status/sha recorded when THIS deployment was analysed. */
+  appliedToDeployment: { status: string; sha: string | null } | null;
+  codeownersStatus: "absent" | "valid" | "unavailable" | "not_read";
+  codeownersPath: string | null;
+  emailsDropped: number;
+};
+
+/** Stage 5.3: owners of the changed files, from the repository's CODEOWNERS. */
+export type OwnersView = {
+  status: InputsView["codeownersStatus"];
+  owners: { owner: string; files: number }[];
+  unowned: number;
+};
+
+export type PullRequestCheckRow = {
+  pr_number: number;
+  head_sha: string;
+  title: string | null;
+  state: string;
+  detail: string | null;
+  risk_level: string | null;
+  updated_at: string;
 };
 
 export type HistoryRow = {
@@ -83,6 +156,11 @@ export type HistoryRow = {
   risk_level: RiskLevel | null;
   risk_analysis_status: RiskAnalysisStatus | null;
   created_at: string;
+  /** Stage 4: the failure was a probable flake / the deployment was reverted. */
+  probable_flake: boolean;
+  reverted: boolean;
+  /** Stage 5.5: "production: success", ... ; empty = environment unknown. */
+  environments: string[];
 };
 
 export type DashboardData = {
@@ -91,7 +169,29 @@ export type DashboardData = {
   notFound: boolean;
   history: HistoryRow[];
   incidents: IncidentListItem[];
+  /** Stage 3: plain counts over every deployment in the current scope. */
+  counts: HistoryCounts;
+  /** Stage 3: history paging. */
+  page: { offset: number; limit: number; hasMore: boolean };
+  /** Stage 4: what DeployGuard has learned in this scope (PostgreSQL only). */
+  learning: { patterns: FailurePattern[]; accuracy: AccuracyRecord; windowDays: number };
 };
+
+/** Stage 5.5: environment labels of the given deployments. */
+async function environmentsOf(ids: string[]): Promise<Map<string, string[]>> {
+  if (ids.length === 0) return new Map();
+  const { rows } = await getPool().query<{ id: string; label: string }>(
+    `SELECT deployment_id::text AS id, environment || ': ' || COALESCE(state, 'state not reported') AS label
+     FROM deployment_environments WHERE deployment_id = ANY($1::bigint[]) ORDER BY environment`,
+    [ids]
+  );
+  const map = new Map<string, string[]>();
+  for (const r of rows) map.set(r.id, [...(map.get(r.id) ?? []), r.label]);
+  return map;
+}
+
+/** Stage 4.3: recurring failure patterns are looked for in this many days. */
+export const PATTERN_WINDOW_DAYS = 60;
 
 export async function getDashboardData(
   options: {
@@ -99,14 +199,33 @@ export async function getDashboardData(
     historyLimit?: number;
     /** Phase 9: the viewer's scope. Everything below is limited to it. */
     scope?: DeploymentScope;
+    /** Stage 3: repository switcher -- narrows the scope to one repository (ANDed in SQL). */
+    githubRepositoryId?: string | null;
+    /** Stage 3: history paging. */
+    historyOffset?: number;
   } = {}
 ): Promise<DashboardData> {
   const scope: DeploymentScope = options.scope ?? { all: true };
-  const [recent, incidents] = await Promise.all([
-    listDeployments(options.historyLimit ?? 25, scope),
-    listIncidents(20, scope),
+  const view: ViewScope = { scope, githubRepositoryId: options.githubRepositoryId ?? null };
+  const limit = options.historyLimit ?? 25;
+  const offset = Math.max(0, options.historyOffset ?? 0);
+  // One extra row tells whether there is an older page.
+  const [page, incidents, counts, latest, patterns, accuracy] = await Promise.all([
+    listDeploymentsPage(view, limit + 1, offset),
+    listIncidentsScoped(view, 20),
+    historyCounts(view),
+    offset > 0 && !options.deploymentId ? listDeploymentsPage(view, 1, 0) : Promise.resolve(null),
+    findFailurePatterns(view, { windowDays: PATTERN_WINDOW_DAYS }),
+    getAccuracyRecord(view),
   ]);
-  const levels = await getLatestRiskLevels(recent.map((d) => d.id));
+  const recent = page.slice(0, limit);
+  const ids = recent.map((d) => d.id);
+  const [levels, flaky, reverted, envs] = await Promise.all([
+    getLatestRiskLevels(ids),
+    flakyDeploymentIds(ids),
+    revertedDeploymentIds(ids),
+    environmentsOf(ids),
+  ]);
 
   const history: HistoryRow[] = recent.map((d) => ({
     id: d.id,
@@ -120,6 +239,9 @@ export async function getDashboardData(
     risk_level: levels.get(d.id) ?? null,
     risk_analysis_status: d.risk_analysis_status,
     created_at: d.created_at.toISOString(),
+    probable_flake: flaky.has(d.id),
+    reverted: reverted.has(d.id),
+    environments: envs.get(d.id) ?? [],
   }));
 
   let current: Deployment | null = null;
@@ -129,21 +251,37 @@ export async function getDashboardData(
     if (current && !scope.all && (!current.repository_id || !scope.repositoryIds.includes(current.repository_id))) {
       current = null;
     }
-  } else current = recent[0] ?? null;
+  } else current = (latest ?? recent)[0] ?? null;
 
-  return {
+  // Stage 1: one last redaction pass over everything the page will render
+  // (incident output, historical matches, assessment text), covering rows
+  // stored before redaction existed.
+  return redactDeep({
     selected: current ? await describe(current) : null,
     notFound: Boolean(options.deploymentId) && !current,
     history,
     incidents,
-  };
+    counts,
+    page: { offset, limit, hasMore: page.length > limit },
+    learning: { patterns, accuracy, windowDays: PATTERN_WINDOW_DAYS },
+  }).value;
 }
 
 async function describe(d: Deployment): Promise<SelectedDeployment> {
-  const [assessment, incident] = await Promise.all([
+  // Stage 4.4: a deployment that passed on a re-run keeps its incident (probable flake), so load it for any status.
+  const [assessment, incident, reverts, repoInputs, environments, prChecks] = await Promise.all([
     getLatestAssessment(d.id),
-    d.status === "FAILED" ? getIncidentForDeployment(d.id) : Promise.resolve(null),
+    getIncidentForDeployment(d.id),
+    getRevertFacts(d.id),
+    getRepositoryInputs(d.github_repository_id),
+    getEnvironments(d.id),
+    listPullRequestChecks(d.github_repository_id, 5),
   ]);
+  const inputs = inputsView(repoInputs, d);
+  const owners: OwnersView =
+    repoInputs?.codeowners_status === "valid" && repoInputs.codeowners
+      ? { status: "valid", ...ownersOfFiles(d.changed_files, repoInputs.codeowners) }
+      : { status: inputs.codeownersStatus, owners: [], unowned: 0 };
 
   // Historical evidence: exactly what the risk analysis saw, when there is one.
   // Otherwise the current structured matches -- database only, no Hindsight.
@@ -155,13 +293,66 @@ async function describe(d: Deployment): Promise<SelectedDeployment> {
     evidence = { source: "database", matches: (similar?.matches ?? []).map(toEvidenceMatch) };
   }
 
-  return { deployment: toDashboardDeployment(d), risk: riskView(d, assessment), incident, evidence };
+  const risk = riskView(d, assessment);
+  return {
+    deployment: toDashboardDeployment(d),
+    risk,
+    incident,
+    reverts,
+    inputs,
+    owners,
+    environments,
+    prChecks,
+    evidence,
+    reanalyze: reanalyzeOffer(d, risk),
+  };
+}
+
+function inputsView(r: RepositoryInputs | null, d: Deployment): InputsView {
+  return {
+    configStatus: r?.config_status ?? "not_read",
+    configErrors: r?.config_errors ?? [],
+    config: r?.config_status === "valid" ? r.config : null,
+    fetchedAt: r?.fetched_at?.toISOString() ?? null,
+    appliedToDeployment: d.analysis_config,
+    codeownersStatus: r?.codeowners_status ?? "not_read",
+    codeownersPath: r?.codeowners_path ?? null,
+    emailsDropped: r?.codeowners_emails_dropped ?? 0,
+  };
+}
+
+async function listPullRequestChecks(githubRepositoryId: string | null, limit: number): Promise<PullRequestCheckRow[]> {
+  if (!githubRepositoryId) return [];
+  const { rows } = await getPool().query<PullRequestCheckRow & { updated_at: Date }>(
+    `SELECT pr_number, head_sha, title, state, detail, risk_level, updated_at
+     FROM pull_request_checks WHERE github_repository_id = $1 ORDER BY updated_at DESC LIMIT $2`,
+    [githubRepositoryId, limit]
+  );
+  return rows.map((r) => ({ ...r, updated_at: r.updated_at.toISOString() }));
+}
+
+function reanalyzeOffer(d: Deployment, risk: RiskView): SelectedDeployment["reanalyze"] {
+  if (!d.file_analysis) return { offered: false, why: "No change analysis is recorded for this deployment, so there is nothing to analyse." };
+  if (d.risk_analysis_status === "pending" || risk.state === "pending") return { offered: false, why: "An analysis is already running." };
+  if (risk.state === "not_analysed") return { offered: true, why: "This deployment has not been analysed." };
+  if (risk.state === "unavailable") {
+    return risk.kind === "usage_limit"
+      ? { offered: false, why: "The usage limit for this repository has been reached." }
+      : { offered: true, why: "The last analysis attempt was unavailable." };
+  }
+  if (d.risk_analysis_status === "unavailable" && unavailableKind(d.risk_analysis_error) !== "usage_limit") {
+    return { offered: true, why: "The latest refresh was unavailable; the assessment shown is older." };
+  }
+  if (risk.basedOnPipeline !== d.status) return { offered: true, why: `The assessment was made when the pipeline was ${risk.basedOnPipeline}; it is now ${d.status}.` };
+  return { offered: false, why: "The assessment is current for this evidence." };
 }
 
 function riskView(d: Deployment, assessment: StoredRiskAssessment | null): RiskView {
   if (!assessment) {
     if (d.risk_analysis_status === "pending") return { state: "pending" };
-    if (d.risk_analysis_status === "unavailable") return { state: "unavailable", error: d.risk_analysis_error };
+    if (d.risk_analysis_status === "unavailable") {
+      return { state: "unavailable", error: d.risk_analysis_error, kind: unavailableKind(d.risk_analysis_error) };
+    }
     return { state: "not_analysed" };
   }
 
@@ -181,6 +372,7 @@ function toDashboardDeployment(d: Deployment): DashboardDeployment {
   return {
     id: d.id,
     repository: `${d.owner}/${d.repository}`,
+    github_repository_id: d.github_repository_id,
     branch: d.branch,
     commit_sha: d.commit_sha,
     commit_message: firstLine(d.commit_message),
@@ -188,11 +380,14 @@ function toDashboardDeployment(d: Deployment): DashboardDeployment {
     created_at: d.created_at.toISOString(),
     status: d.status,
     ci_run_id: d.ci_run_id,
-    ci_run_url: d.ci_run_url,
+    // Stage 1: only an https://github.com link can become a link on the page.
+    ci_run_url: safeGithubUrl(d.ci_run_url),
     ci_started_at: d.ci_started_at?.toISOString() ?? null,
     ci_finished_at: d.ci_finished_at?.toISOString() ?? null,
     failure:
-      d.status === "FAILED" ? { stage: d.failure_stage, job: d.failure_job, message: d.failure_message } : null,
+      d.status === "FAILED"
+        ? { stage: redactNullable(d.failure_stage), job: redactNullable(d.failure_job), message: redactNullable(d.failure_message) }
+        : null,
     change_categories: d.change_categories,
     affected_services: d.affected_services,
     file_analysis: d.file_analysis,

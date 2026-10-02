@@ -28,6 +28,7 @@ export function buildIncidentMemory(incident: Incident, deployment: Deployment):
   const repo = `${deployment.owner}/${deployment.repository}`;
   const shortSha = deployment.commit_sha.slice(0, 7);
   const stage = deployment.failure_stage ?? "unknown";
+  const confirmed = incident.confirmed_revision !== null;
 
   const lines = [
     `Incident #${incident.id}: deployment #${deployment.id} of repository ${repo} ` +
@@ -40,10 +41,18 @@ export function buildIncidentMemory(incident: Incident, deployment: Deployment):
     incident.error_message
       ? `Observed failure output:\n${truncate(incident.error_message, MAX_ERROR_TEXT)}`
       : "The pipeline did not report any failure output.",
-    `Affected service: ${known(incident.affected_service)}.`,
-    `Downstream effect: ${known(incident.downstream_effect)}.`,
-    `Root cause: ${known(incident.root_cause)}.`,
-    `Resolution: ${known(incident.resolution)}.`,
+    // Stage 4.1: only human-confirmed values are stated, with who confirmed them.
+    ...(confirmed
+      ? [`The following were HUMAN-CONFIRMED by @${incident.confirmed_by_login} on ${incident.confirmed_at?.toISOString().slice(0, 10)} (revision ${incident.confirmed_revision}):`]
+      : []),
+    `Affected service: ${known(confirmed ? incident.affected_service : null)}.`,
+    `Downstream effect: ${known(confirmed ? incident.downstream_effect : null)}.`,
+    `Root cause: ${known(confirmed ? incident.root_cause : null)}.`,
+    `Resolution: ${known(confirmed ? incident.resolution : null)}.`,
+    // Stage 4.4
+    ...(incident.flake_status === "probable_flake"
+      ? [`Probable flake: a re-run of the same commit passed afterwards with no code change (passing run ${incident.flake_passing_run_id ?? "not reported"}).`]
+      : []),
     ...(deployment.ci_run_url ? [`GitHub Actions run: ${deployment.ci_run_url}.`] : []),
   ];
 
@@ -77,8 +86,11 @@ export function buildIncidentMemory(incident: Incident, deployment: Deployment):
       failure_stage: stage,
       ...(incident.failure_job ? { failure_job: incident.failure_job } : {}),
       // Recorded explicitly so a reader can tell "unknown" from "forgot to copy".
-      root_cause_known: String(incident.root_cause !== null),
-      resolution_known: String(incident.resolution !== null),
+      root_cause_known: String(confirmed && incident.root_cause !== null),
+      resolution_known: String(confirmed && incident.resolution !== null),
+      // Stage 4
+      provenance: confirmed ? "HUMAN-CONFIRMED" : "NOT DETERMINED",
+      probable_flake: String(incident.flake_status === "probable_flake"),
     },
   };
 }

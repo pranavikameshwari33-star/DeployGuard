@@ -10,7 +10,7 @@ export const dynamic = "force-dynamic";
  *
  * The `deployments` table, newest first -- limited to the caller's scope
  * (Phase 9): a signed-in user sees only deployments of their connected
- * repositories; internal tooling (Bearer DEPLOYGUARD_STATUS_TOKEN) sees all.
+ * repositories; internal tooling (Bearer DEPLOYGUARD_INTERNAL_TOKEN) sees all.
  */
 export async function GET(request: Request) {
   const viewer = await getViewer();

@@ -3,6 +3,8 @@ import { env } from "@/lib/env";
 import { isAuthorized } from "@/lib/auth/bearer-token";
 import type { DeploymentKey, PipelineStatus, StatusUpdate } from "@/lib/db/deployments";
 import { applyPipelineStatus } from "@/lib/pipeline/apply-status";
+import { logErrorRef } from "@/lib/auth/session";
+import { rateLimitResponse } from "@/lib/auth/rate-limit";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -38,7 +40,12 @@ export const dynamic = "force-dynamic";
  *                  Hindsight outage must not undo or hide that.
  */
 export async function POST(request: Request) {
+  const limited = await rateLimitResponse(request, "ciStatus");
+  if (limited) return limited;
+
   // ---------- stage 1: authenticity ----------
+  // Stage 1: ONLY the CI status token is accepted here. The internal
+  // maintenance token is rejected (it simply does not match).
   let expectedToken: string;
   try {
     expectedToken = env.deployguardStatusToken();
@@ -85,10 +92,11 @@ export async function POST(request: Request) {
   try {
     result = await applyPipelineStatus(key, update, "ci");
   } catch (error) {
-    const message = (error as Error).message;
-    console.error(`[DeployGuard][db] Failed to update status for ${label}: ${message}`);
+    // Stage 1: the database message stays in the server log. This response is
+    // printed in GitHub Actions logs, which can be public.
+    const errorRef = logErrorRef(`Failed to update status for ${label}: ${(error as Error).message}`, "db");
     return NextResponse.json(
-      { ok: false, stage: "database", error: "Failed to update the deployment record.", detail: message },
+      { ok: false, stage: "database", error: "Failed to update the deployment record.", errorRef },
       { status: 500 }
     );
   }
@@ -126,11 +134,17 @@ export async function POST(request: Request) {
         ok: false,
         stage: "incident",
         error: "The FAILED status was saved, but the incident record could not be written.",
-        detail: result.message,
+        errorRef: logErrorRef(result.message, "incident"),
         deploymentId: result.deployment.id,
       },
       { status: 500 }
     );
+  }
+
+  // Stage 2: an out-of-date report (older than what was already applied) is a
+  // harmless no-op, not an error: the pipeline must not retry it.
+  if (result.outcome === "stale_event") {
+    return NextResponse.json({ ok: true, stage: "database", ignored: "out-of-date status report", status: result.currentStatus });
   }
 
   const { deployment, previousStatus, incident, incidentMemory, memory } = result;
@@ -149,10 +163,11 @@ export async function POST(request: Request) {
           id: incident.incident.id,
           created: incident.isNew,
           failureType: incident.incident.failure_type,
-          memory: incidentMemory,
+          memory: incidentMemory ? { queued: incidentMemory.queued, jobId: incidentMemory.jobId } : undefined,
         }
       : undefined,
-    memory,
+    // Stage 2: Hindsight writes are queued jobs, not done inside this request.
+    memory: "skipped" in memory ? memory : { queued: memory.queued, jobId: memory.jobId },
   });
 }
 
