@@ -17,6 +17,13 @@ import { kickQueue } from "@/lib/jobs/runner";
 import { logErrorRef } from "@/lib/auth/session";
 
 // node:crypto is not available on the Edge runtime, so pin this to Node.
+/** Events processed after the response as queued jobs; their payload is kept in the delivery log until then. */
+const DEFERRED_EVENTS: Record<string, string> = {
+  workflow_run: JOB_TYPES.workflowRun,
+  pull_request: JOB_TYPES.pullRequestCheck,
+  deployment_status: JOB_TYPES.deploymentStatus,
+};
+
 export const runtime = "nodejs";
 // Never cache a webhook: every delivery must actually run this code.
 export const dynamic = "force-dynamic";
@@ -120,7 +127,7 @@ export async function POST(request: Request) {
         installationId: typeof meta.installation?.id === "number" ? meta.installation.id : null,
         githubRepositoryId: typeof meta.repository?.id === "number" ? meta.repository.id : null,
         // Only deferred work needs its payload kept until it has run.
-        payload: eventType === "workflow_run" ? payload : undefined,
+        payload: DEFERRED_EVENTS[eventType] ? payload : undefined,
       });
       if (!begin.proceed) {
         console.log(`[DeployGuard] Delivery ${deliveryId} (${eventType}) already ${begin.status} - duplicate ignored.`);
@@ -158,6 +165,20 @@ export async function POST(request: Request) {
     console.error(`[DeployGuard][github] Failed to process ${eventType} (delivery ${deliveryId}): ${message}`);
     finish("failed", message);
     return NextResponse.json({ ok: false, stage: "database", error: `Failed to process ${eventType}.` }, { status: 500 });
+  }
+
+  // Stage 5: pull_request (advisory PR checks) and deployment_status (environments)
+  // are deferred exactly like workflow_run: payload in the delivery log, one job per delivery.
+  if (eventType === "pull_request" || eventType === "deployment_status") {
+    try {
+      if (!tracked) throw new Error("delivery log unavailable");
+      await enqueue(DEFERRED_EVENTS[eventType], { deliveryId }, { dedupeKey: `webhook:${deliveryId}`, maxAttempts: 6 });
+    } catch (error) {
+      const errorRef = logErrorRef(`Could not queue ${eventType} ${deliveryId}: ${(error as Error).message}`, "jobs");
+      return NextResponse.json({ ok: false, stage: "queue", error: "Could not queue the event.", errorRef }, { status: 500 });
+    }
+    kickQueue();
+    return NextResponse.json({ ok: true, event: eventType, accepted: true, queued: true }, { status: 202 });
   }
 
   if (eventType === "workflow_run") {

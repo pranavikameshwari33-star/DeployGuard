@@ -22,12 +22,14 @@ export type GeminiErrorKind =
   | "blocked";      // Stage 1: the request contained a server secret and was not sent
 
 export class GeminiError extends Error {
-  constructor(
-    message: string,
-    readonly kind: GeminiErrorKind,
-    readonly status?: number
-  ) {
+  // Plain fields (not constructor parameter properties) so Node's type
+  // stripping can load this module in the verification scripts.
+  readonly kind: GeminiErrorKind;
+  readonly status?: number;
+  constructor(message: string, kind: GeminiErrorKind, status?: number) {
     super(message);
+    this.kind = kind;
+    this.status = status;
     this.name = "GeminiError";
   }
 }

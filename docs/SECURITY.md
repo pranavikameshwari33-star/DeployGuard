@@ -123,13 +123,23 @@ Derived from every GitHub API call in the code (`lib/github/app.ts`,
 | Metadata | Read | mandatory; repository list of an installation (`/installation/repositories`) |
 | Contents | Read | commit details for missed-push recovery (`/repos/{r}/commits/{sha}`) |
 | Actions | Read | workflow runs, jobs and job logs (`/actions/runs`, `/actions/runs/{id}/jobs`, `/actions/jobs/{id}/logs`) |
+| Contents | Read (Stage 5, same permission) | `.deployguard.yml` and `CODEOWNERS` on the default branch (`/repos/{r}/contents/{path}`) |
+| Pull requests | Read (Stage 5.1) | the files of a pull request (`/repos/{r}/pulls/{n}/files`) |
+| Checks | **Write** (Stage 5.1) | create/update ONE advisory check run per PR head commit (`/check-runs`); conclusion always `neutral` |
+| Deployments | Read (Stage 5.5) | environments of a commit (`/repos/{r}/deployments?sha=`, `/deployments/{id}/statuses`) |
 
-Subscribed events: `push`, `workflow_run` (plus `installation` /
-`installation_repositories`, which every App receives). User authorization: identity
-(`/user`) and the user's installations (`/user/installations`), used once at sign-in /
-connect and discarded. Nothing else is needed today: no write permission of any kind, no
-Pull requests, Checks, Deployments or Issues access. Those are only added if and when
-Stage 5 features are enabled.
+Subscribed events: `push`, `workflow_run`, and for Stage 5 `pull_request` and
+`deployment_status` (plus `installation` / `installation_repositories`, which every App
+receives). User authorization: identity (`/user`) and the user's installations
+(`/user/installations`), used once at sign-in / connect and discarded.
+
+**Checks: write is the only write permission.** It is used solely to post advisory check
+runs whose conclusion is always `neutral` (GitHub treats neutral as passing, so it can
+never block a merge, even if someone marks the check as required). DeployGuard never
+writes code, comments, statuses, labels or reviews. Without the Stage 5 permissions
+DeployGuard keeps working: PR checks are recorded as "permission missing" and
+environments stay "environment unknown". Not requested: Issues, Statuses,
+Administration, Secrets, any write to Contents.
 
 **MANUAL:** compare the App's actual settings on GitHub with this table and remove
 anything extra. A second person should review the App listing.

@@ -21,6 +21,7 @@ import {
   IncidentHistory,
   PipelinePanel,
   RecalledMemory,
+  RepositoryInputs,
   RepositorySwitcher,
   RiskPanel,
 } from "./_components/sections";
@@ -213,12 +214,14 @@ export default async function Dashboard({
                   links={links}
                   canAct={Boolean(user)}
                   memoryHref={memory ? null : links.memory(selected.deployment.id)}
+                  owners={selected.owners}
                 />
                 {memory ? <RecalledMemory data={memory} links={links} closeHref={links.deployment(selected.deployment.id)} /> : null}
-                <ChangeAnalysis d={selected.deployment} />
+                <ChangeAnalysis d={selected.deployment} owners={selected.owners} />
               </div>
               <div className="stack">
-                <PipelinePanel d={selected.deployment} incident={selected.incident} reverts={selected.reverts} links={links} />
+                <PipelinePanel d={selected.deployment} incident={selected.incident} reverts={selected.reverts} environments={selected.environments} links={links} />
+                {selected.deployment.github_repository_id ? <RepositoryInputs inputs={selected.inputs} prChecks={selected.prChecks} /> : null}
                 {user ? <ConnectedRepositories repositories={user.repositories} links={links} /> : null}
               </div>
             </div>

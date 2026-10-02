@@ -2,6 +2,8 @@ import { analyzeChanges } from "@/lib/analysis/change-analysis";
 import { insertDeployment, type Deployment } from "@/lib/db/deployments";
 import { detectRevert } from "@/lib/db/learning";
 import { env } from "@/lib/env";
+import { analysisConfigOf } from "@/lib/config/repo-config";
+import { effectiveConfig, getRepositoryInputs, maybeQueueInputsRefresh } from "@/lib/github/repo-inputs";
 import type { PushEvent } from "@/lib/github/parse-push-event";
 import { enqueue } from "@/lib/jobs/queue";
 import { JOB_TYPES } from "@/lib/jobs/types";
@@ -63,19 +65,36 @@ export async function ingestPush(
     );
   }
 
+  // Stage 5: the repository's cached .deployguard.yml (a database read; GitHub is never called here).
+  const githubRepositoryId = event.githubRepositoryId != null ? String(event.githubRepositoryId) : null;
+  const inputs = repositoryId ? await getRepositoryInputs(githubRepositoryId).catch(() => null) : null;
+  const config = effectiveConfig(inputs);
+
   // Phase 5: classify the changed files by path (deterministic, no I/O).
-  const analysis = analyzeChanges({
-    added: event.addedFiles,
-    modified: event.modifiedFiles,
-    deleted: event.deletedFiles,
-  });
+  const analysis = analyzeChanges(
+    {
+      added: event.addedFiles,
+      modified: event.modifiedFiles,
+      deleted: event.deletedFiles,
+    },
+    analysisConfigOf(config)
+  );
   console.log(
     `[DeployGuard][analysis] Categories: ${analysis.categories.join(", ") || "(none)"} | ` +
       `Services/components: ${analysis.services.join(", ") || "(none determined)"}`
   );
 
   // Database (source of truth). Throws on failure; the caller decides the HTTP answer.
-  const { deployment, isNew } = await insertDeployment(event, analysis, repositoryId);
+  const { deployment, isNew } = await insertDeployment(
+    event,
+    analysis,
+    repositoryId,
+    repositoryId ? { status: inputs?.config_status ?? "not_read_yet", sha: config ? inputs?.config_sha ?? null : null } : null
+  );
+  // Owned repositories only: keep the cached config/CODEOWNERS fresh (queued, never inline).
+  if (repositoryId) {
+    await maybeQueueInputsRefresh(githubRepositoryId, { branch: event.branch, commitSha: event.commitSha, changedFiles: event.changedFiles }, inputs);
+  }
 
   if (!isNew) {
     console.log(

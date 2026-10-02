@@ -86,6 +86,10 @@ async function deleteRows(deploymentIds: string[], githubRepositoryId: string | 
     if (githubRepositoryId) {
       const w = await client.query(`DELETE FROM github_webhook_deliveries WHERE github_repository_id = $1`, [githubRepositoryId]);
       report.deliveriesDeleted = w.rowCount ?? 0;
+      // Stage 5: PR check records and the cached config / CODEOWNERS of the repository.
+      await client.query(`DELETE FROM pull_request_checks WHERE github_repository_id = $1`, [githubRepositoryId]);
+      await client.query(`DELETE FROM repository_inputs WHERE github_repository_id = $1`, [githubRepositoryId]);
+      await client.query(`DELETE FROM jobs WHERE status IN ('queued', 'dead') AND payload->>'githubRepositoryId' = $1`, [githubRepositoryId]);
     }
     await client.query("COMMIT");
   } catch (error) {
@@ -226,6 +230,16 @@ export async function exportRepository(githubRepositoryId: string) {
                 FROM deployment_reverts r JOIN deployments d ON d.id = r.reverted_deployment_id
                 WHERE d.github_repository_id = $1 ORDER BY r.detected_at`, [githubRepositoryId]),
   ]);
+  // Stage 5 inputs and records.
+  const [prChecks, inputs, environments] = await Promise.all([
+    pool.query(`SELECT pr_number, head_sha, base_ref, title, state, detail, risk_level, analysis_status, assessment, files_analysed, created_at, updated_at
+                FROM pull_request_checks WHERE github_repository_id = $1 ORDER BY created_at`, [githubRepositoryId]),
+    pool.query(`SELECT default_branch, config_status, config, config_errors, codeowners_status, codeowners_path, codeowners, fetched_at
+                FROM repository_inputs WHERE github_repository_id = $1`, [githubRepositoryId]),
+    pool.query(`SELECT e.deployment_id::text, e.environment, e.state, e.state_at, e.source
+                FROM deployment_environments e JOIN deployments d ON d.id = e.deployment_id
+                WHERE d.github_repository_id = $1 ORDER BY e.deployment_id`, [githubRepositoryId]),
+  ]);
   return {
     format: "deployguard-export/1",
     exported_at: new Date().toISOString(),
@@ -236,6 +250,9 @@ export async function exportRepository(githubRepositoryId: string) {
     incident_confirmations: confirmations.rows,
     risk_outcomes: outcomes.rows,
     deployment_reverts: reverts.rows,
+    pull_request_checks: prChecks.rows,
+    repository_inputs: inputs.rows[0] ?? null,
+    deployment_environments: environments.rows,
     notes: [
       "Recalled Hindsight memories are not included: they are derived from these records.",
       "Ingested text (commit messages, CI output) was redacted before it was stored.",

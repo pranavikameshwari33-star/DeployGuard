@@ -20,6 +20,9 @@ substitute for a legal review (**MANUAL**: legal/privacy review not performed).
 | `risk_assessments` | the validated assessment, and the exact evidence bundle that was sent to Gemini | the prediction cannot be edited (database trigger); only text redaction may change a row |
 | `risk_outcomes` | Stage 4: per finished deployment, the pre-CI prediction compared with the outcome (hit / miss / false alarm / unscored) | append-only (database trigger) |
 | `deployment_reverts` | Stage 4: which deployment reverted which, how it was recognised, hours between | |
+| `repository_inputs` | Stage 5: the VALIDATED `.deployguard.yml` (or its errors) and CODEOWNERS rules (@handles/@teams only; email owners dropped) | refreshed every 6 h on push; raw files never stored |
+| `pull_request_checks` | Stage 5: PR number, head SHA, redacted title, state, validated assessment and the evidence sent to Gemini | deleted by repository purge |
+| `deployment_environments` | Stage 5: GitHub deployment id, environment name (sanitised), latest state and time | |
 | `users`, `sessions` | GitHub user id, login, display name, avatar URL; a SHA-256 hash of the session token | |
 | `github_installations`, `repositories` | installation/account ids and logins, repository names, private flag, connection state | |
 | `github_webhook_deliveries` | delivery GUID, event, action, ids, outcome, a redacted error; the (redacted) payload only until a queued `workflow_run` is processed | pruned after 14/30 days |

@@ -10,9 +10,15 @@
  * below that produced it. Anything no rule recognises is "unknown" -- the
  * analyzer never guesses.
  *
- * This file has no imports on purpose, so the unit tests and verification
- * scripts can load it directly with Node's type stripping.
+ * It imports only the pure glob helper (relative path), so the unit tests and
+ * verification scripts can load it directly with Node's type stripping.
+ *
+ * Stage 5: explicit categories for migrations, lockfiles, dependency
+ * manifests, infrastructure-as-code, container files and environment files,
+ * and an optional per-repository config (.deployguard.yml) that can add
+ * categories, map paths to services, mark critical paths and ignore paths.
  */
+import { matchesGlob } from "./glob.ts";
 
 /** The fixed set of categories, in the order they are always reported. */
 export const CHANGE_CATEGORIES = [
@@ -27,6 +33,13 @@ export const CHANGE_CATEGORIES = [
   "tests",
   "documentation",
   "dependencies",
+  // Stage 5: finer signals. They are added alongside the broad categories above.
+  "migration",
+  "lockfile",
+  "dependency_manifest",
+  "iac",
+  "container",
+  "environment",
   "unknown",
 ] as const;
 
@@ -40,6 +53,18 @@ export type FileAnalysis = {
   categories: ChangeCategory[];
   /** The service/component named by the path, or null when the path does not name one. */
   service: string | null;
+  /** Stage 5 (.deployguard.yml): matched a critical path / an ignore pattern; which config rules applied. */
+  critical?: boolean;
+  ignored?: boolean;
+  rules?: string[];
+};
+
+/** Stage 5: the validated, normalised part of .deployguard.yml that affects analysis. */
+export type AnalysisConfig = {
+  ignore: string[];
+  critical: string[];
+  services: { pattern: string; service: string }[];
+  categories: { pattern: string; categories: ChangeCategory[] }[];
 };
 
 /** The analysis of a whole push. `categories` and `services` are the union over all files. */
@@ -47,6 +72,9 @@ export type ChangeAnalysis = {
   files: FileAnalysis[];
   categories: ChangeCategory[];
   services: string[];
+  /** Stage 5: paths matching a configured critical path / ignore pattern. */
+  critical?: string[];
+  ignored?: string[];
 };
 
 // ---------------------------------------------------------------------------
@@ -77,6 +105,21 @@ const DEPENDENCY_FILES = new Set([
   "go.mod", "go.sum", "cargo.toml", "cargo.lock", "gemfile", "gemfile.lock",
   "pom.xml", "build.gradle", "build.gradle.kts", "composer.json", "composer.lock",
 ]);
+/** Stage 5: exact dependency resolutions vs declared dependencies. */
+const LOCKFILES = new Set([
+  "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json", "bun.lockb", "pipfile.lock",
+  "poetry.lock", "uv.lock", "go.sum", "cargo.lock", "gemfile.lock", "composer.lock", "packages.lock.json", "gradle.lockfile",
+]);
+const MANIFESTS = new Set([
+  "package.json", "pipfile", "pyproject.toml", "setup.py", "setup.cfg", "go.mod", "cargo.toml", "gemfile",
+  "pom.xml", "build.gradle", "build.gradle.kts", "composer.json",
+]);
+const MIGRATION_DIRS = new Set(["migrations", "migration", "migrate", "alembic", "flyway", "liquibase", "changelogs"]);
+const IAC_DIRS = new Set(["terraform", "k8s", "kubernetes", "helm", "charts", "ansible", "pulumi", "cloudformation", "cdk", "bicep"]);
+const IAC_FILES = new Set(["serverless.yml", "serverless.yaml", "cdk.json", "pulumi.yaml", "pulumi.yml", "chart.yaml", "kustomization.yaml", "kustomization.yml", "skaffold.yaml"]);
+const IAC_EXTENSIONS = new Set(["tf", "tfvars", "hcl", "bicep"]);
+const ENVIRONMENT_NAMES = new Set(["production", "prod", "staging", "stage", "development", "dev", "qa", "uat", "preview"]);
+
 const DOC_NAMES = new Set(["readme", "changelog", "license", "contributing", "code_of_conduct"]);
 const CI_FILES = new Set([".gitlab-ci.yml", "jenkinsfile", ".travis.yml", "azure-pipelines.yml", "bitbucket-pipelines.yml"]);
 const CI_DIRS = [".github/workflows/", ".circleci/", ".buildkite/"];
@@ -93,7 +136,7 @@ const COMPONENT_DIRS = new Set(["frontend", "backend", "client", "server", "web"
 const SERVICE_DIR_PATTERN = /^[a-z0-9][a-z0-9_.-]*[-_](service|svc|api|app|worker)$|^(service|svc)[-_][a-z0-9_.-]+$/;
 
 /** Classifies one path. Pure: no I/O, same answer every time. */
-export function classifyFile(path: string, changeType: ChangeType): FileAnalysis {
+export function classifyFile(path: string, changeType: ChangeType, config?: AnalysisConfig): FileAnalysis {
   const normalized = path.replace(/\\/g, "/").replace(/^\.\//, "");
   const lower = normalized.toLowerCase();
   const segments = lower.split("/").filter(Boolean);
@@ -121,6 +164,32 @@ export function classifyFile(path: string, changeType: ChangeType): FileAnalysis
     DOC_EXTENSIONS.has(ext) || DOC_NAMES.has(stem) || dirs.some((dir) => DOC_DIRS.has(dir));
   const isEnvFile = base === ".env" || base.startsWith(".env.");
   const isToolConfig = /\.config\.[a-z]+$/.test(base) || /^\.[a-z0-9_-]+rc(\.[a-z]+)?$/.test(base);
+
+  // --- Stage 5: finer, explicit signals -----------------------------------------
+  const isRequirements = /^requirements([-_.][a-z0-9_-]+)?\.(txt|in)$/.test(base);
+  const isLockfile = LOCKFILES.has(base);
+  const isManifest = MANIFESTS.has(base) || isRequirements;
+  const isMigration =
+    dirs.some((dir) => MIGRATION_DIRS.has(dir)) ||
+    /\.migration\.[a-z0-9]+$/.test(base) ||
+    (/^(v?\d{3,}|\d{8,})[_.-][a-z0-9_.-]+\.(sql|py|rb|js|ts)$/.test(base) && dirs.some((dir) => ["db", "database", "sql", "schema"].includes(dir)));
+  const isIac =
+    IAC_EXTENSIONS.has(ext) || IAC_FILES.has(base) || dirs.some((dir) => IAC_DIRS.has(dir)) ||
+    /(^|[.-])(cloudformation|cfn)([.-]|$)/.test(stem);
+  const isContainer =
+    base === "dockerfile" || base.startsWith("dockerfile.") || base.endsWith(".dockerfile") || base === "containerfile" ||
+    base === ".dockerignore" || /^(docker-)?compose(\.[a-z0-9_-]+)?\.ya?ml$/.test(base);
+  const isEnvironment =
+    isEnvFile || ext === "env" ||
+    (CONFIG_EXTENSIONS.has(ext) && ENVIRONMENT_NAMES.has(stem.replace(/^(application|appsettings|config|settings)[._-]/, ""))) ||
+    dirs.some((dir) => dir === "environments" || dir === "envs");
+
+  if (isMigration) found.add("migration").add("database");
+  if (isLockfile) found.add("lockfile").add("dependencies");
+  if (isManifest) found.add("dependency_manifest").add("dependencies");
+  if (isIac) found.add("iac").add("infrastructure");
+  if (isContainer) found.add("container").add("infrastructure");
+  if (isEnvironment) found.add("environment").add("configuration");
 
   if (isCi) found.add("ci_cd");
   if (isInfra) found.add("infrastructure");
@@ -154,14 +223,42 @@ export function classifyFile(path: string, changeType: ChangeType): FileAnalysis
     if (words.some((word) => tokens.has(word))) found.add(category);
   }
 
+  // --- Stage 5: repository config (.deployguard.yml), applied last --------------
+  const rules: string[] = [];
+  let service: string | null = null;
+  let critical = false;
+  let ignored = false;
+  if (config) {
+    for (const rule of config.categories) {
+      if (matchesGlob(normalized, rule.pattern)) {
+        rule.categories.forEach((c) => found.add(c));
+        rules.push(`categories:${rule.pattern}`);
+      }
+    }
+    for (const rule of config.services) {
+      if (service === null && matchesGlob(normalized, rule.pattern)) {
+        service = rule.service;
+        rules.push(`service:${rule.pattern}`);
+      }
+    }
+    critical = config.critical.some((p) => matchesGlob(normalized, p));
+    ignored = config.ignore.some((p) => matchesGlob(normalized, p));
+    if (critical) rules.push("critical");
+    if (ignored) rules.push("ignored");
+  }
+
   if (found.size === 0) found.add("unknown");
+  else if (found.size > 1) found.delete("unknown");
 
   const categories = CHANGE_CATEGORIES.filter((category) => found.has(category));
   return {
     path: normalized,
     change_type: changeType,
     categories,
-    service: serviceFor(segments, categories),
+    service: service ?? serviceFor(segments, categories),
+    ...(critical ? { critical: true } : {}),
+    ...(ignored ? { ignored: true } : {}),
+    ...(rules.length ? { rules } : {}),
   };
 }
 
@@ -197,26 +294,31 @@ function serviceFor(segments: string[], categories: ChangeCategory[]): string | 
 }
 
 /** Analyses a whole push. Files come back sorted by path; unions are in canonical order. */
-export function analyzeChanges(files: {
-  added: string[];
-  modified: string[];
-  deleted: string[];
-}): ChangeAnalysis {
+export function analyzeChanges(
+  files: { added: string[]; modified: string[]; deleted: string[] },
+  /** Stage 5: the repository's validated .deployguard.yml, if any. */
+  config?: AnalysisConfig
+): ChangeAnalysis {
   const analysed = [
-    ...files.added.map((path) => classifyFile(path, "added")),
-    ...files.modified.map((path) => classifyFile(path, "modified")),
-    ...files.deleted.map((path) => classifyFile(path, "deleted")),
+    ...files.added.map((path) => classifyFile(path, "added", config)),
+    ...files.modified.map((path) => classifyFile(path, "modified", config)),
+    ...files.deleted.map((path) => classifyFile(path, "deleted", config)),
   ].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
-  const categorySet = new Set(analysed.flatMap((file) => file.categories));
+  // Ignored files stay in the file list (labelled) but do not shape the union.
+  const counted = analysed.filter((file) => !file.ignored);
+  const categorySet = new Set(counted.flatMap((file) => file.categories));
   const services = [
-    ...new Set(analysed.map((file) => file.service).filter((s): s is string => s !== null)),
+    ...new Set(counted.map((file) => file.service).filter((s): s is string => s !== null)),
   ].sort();
 
   return {
     files: analysed,
     categories: CHANGE_CATEGORIES.filter((category) => categorySet.has(category)),
     services,
+    ...(config
+      ? { critical: analysed.filter((f) => f.critical).map((f) => f.path), ignored: analysed.filter((f) => f.ignored).map((f) => f.path) }
+      : {}),
   };
 }
 

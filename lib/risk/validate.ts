@@ -63,6 +63,8 @@ export type EvidenceMatch = {
   matched_signals: string[];
   /** Stage 4.5: this past deployment was reverted by a later one. */
   reverted_by?: EvidenceRevert | null;
+  /** Stage 5.5: "production: success", ... or ["environment unknown"]. */
+  environments?: string[];
 };
 
 export type RiskEvidence = {
@@ -81,6 +83,9 @@ export type RiskEvidence = {
     /** Stage 4.5: this deployment reverts an earlier one / was itself reverted. */
     reverts?: EvidenceRevert | null;
     reverted_by?: EvidenceRevert | null;
+    /** Stage 5.5 / 5.2 */
+    environments?: string[];
+    critical_files?: string[];
   };
   change_analysis: {
     change_categories: string[];

@@ -28,7 +28,8 @@
     "verify:migrations": "node scripts/verify-migrations.mjs",
     "verify:dashboard": "node --experimental-strip-types --no-warnings --import ./scripts/ts-alias.mjs scripts/verify-dashboard.mjs",
     "eval:risk": "node --experimental-strip-types --no-warnings --import ./scripts/ts-alias.mjs scripts/evaluate-risk.mjs",
-    "verify:learning": "node --experimental-strip-types --no-warnings --import ./scripts/ts-alias.mjs scripts/verify-learning.mjs"
+    "verify:learning": "node --experimental-strip-types --no-warnings --import ./scripts/ts-alias.mjs scripts/verify-learning.mjs",
+    "verify:inputs": "node --experimental-strip-types --no-warnings --import ./scripts/ts-alias.mjs scripts/verify-inputs.mjs"
   },
   "dependencies": {
     "next": "16.3.6",

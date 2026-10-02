@@ -57,6 +57,10 @@ export type Deployment = {
   redaction: DeploymentRedaction | null;
   /** Stage 2: GitHub time of the newest pipeline event applied (ordering guard). */
   ci_last_event_at: Date | null;
+  /** Stage 5: which .deployguard.yml shaped the analysis; environment lookup state. */
+  analysis_config: { status: string; sha: string | null } | null;
+  environments_status: "found" | "none" | "unavailable" | null;
+  environments_checked_at: Date | null;
 };
 
 export type RedactionCount = { count: number; categories: string[] };
@@ -76,7 +80,8 @@ const COLUMNS = `
   updated_at, ci_run_id, ci_run_url, ci_started_at, ci_finished_at,
   failure_stage, failure_job, failure_message, file_analysis, change_categories,
   affected_services, risk_analysis_status, risk_analysis_error, risk_analysis_updated_at,
-  repository_id, github_repository_id, redaction, ci_last_event_at
+  repository_id, github_repository_id, redaction, ci_last_event_at, analysis_config,
+  environments_status, environments_checked_at
 `;
 
 /**
@@ -98,7 +103,9 @@ export async function insertDeployment(
   event: PushEvent,
   analysis: ChangeAnalysis,
   /** Phase 9: the connected repository this push belongs to; null for an unowned (plain webhook) push. */
-  repositoryId: string | null = null
+  repositoryId: string | null = null,
+  /** Stage 5: which .deployguard.yml shaped the analysis ({ status, sha }), or null. */
+  analysisConfig: { status: string; sha: string | null } | null = null
 ): Promise<InsertResult> {
   const pool = getPool();
 
@@ -107,9 +114,9 @@ export async function insertDeployment(
        repository, owner, branch, commit_sha, commit_message, author,
        changed_files, added_files, modified_files, deleted_files, status,
        file_analysis, change_categories, affected_services,
-       repository_id, github_repository_id, redaction
+       repository_id, github_repository_id, redaction, analysis_config
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'RECEIVED', $11::jsonb, $12, $13, $14, $15, $16::jsonb)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'RECEIVED', $11::jsonb, $12, $13, $14, $15, $16::jsonb, $17::jsonb)
      -- Either unique key (name-based, or Stage 2 repository-id-based) means "already recorded".
      ON CONFLICT DO NOTHING
      RETURNING ${COLUMNS}`,
@@ -130,6 +137,7 @@ export async function insertDeployment(
       repositoryId,
       event.githubRepositoryId,
       event.commitMessageRedaction?.count ? JSON.stringify({ commit_message: event.commitMessageRedaction }) : null,
+      analysisConfig ? JSON.stringify(analysisConfig) : null,
     ]
   );
 
@@ -301,6 +309,8 @@ export type HistoricalDeployment = Deployment & {
   incident_flake_status: string | null;
   reverted_by_deployment_id: string | null;
   reverted_hours_after: string | null;
+  /** Stage 5.5: GitHub deployment environments of this commit. */
+  environment_list: { name: string; state: string | null }[];
 };
 
 /**
@@ -331,7 +341,9 @@ export async function findHistoryCandidates(
             i.confirmed_at       AS incident_confirmed_at,
             i.flake_status       AS incident_flake_status,
             rv.reverting_deployment_id::text AS reverted_by_deployment_id,
-            rv.hours_after::text AS reverted_hours_after
+            rv.hours_after::text AS reverted_hours_after,
+            (SELECT COALESCE(json_agg(json_build_object('name', e.environment, 'state', e.state) ORDER BY e.environment), '[]'::json)
+             FROM deployment_environments e WHERE e.deployment_id = d.id) AS environment_list
      FROM deployments d
      LEFT JOIN incidents i ON i.deployment_id = d.id
      -- Stage 4.5: the first observed revert of this deployment, if any.

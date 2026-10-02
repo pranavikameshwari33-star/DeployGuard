@@ -7,6 +7,7 @@ import {
 } from "@/lib/db/deployments";
 import { getIncidentForDeployment } from "@/lib/db/incidents";
 import { recall } from "@/lib/hindsight/client";
+import type { EnvironmentFacts } from "@/lib/db/environments";
 import {
   DEFAULT_MIN_SCORE,
   SIMILARITY_WEIGHTS,
@@ -63,6 +64,8 @@ export type HistoricalEvidence = {
   } | null;
   /** Stage 4.5: observed revert of this deployment by a later one. */
   reverted_by: { deployment_id: string; hours_after: number } | null;
+  /** Stage 5.5: GitHub deployment environments of this deployment ("unknown" unless found). */
+  environments: EnvironmentFacts;
   similarity_score: number;
   relevance: "strong" | "weak";
   matched_signals: MatchedSignal[];
@@ -105,6 +108,15 @@ export async function findSimilarDeployments(
 ): Promise<SimilarityResult | null> {
   const current = await getDeploymentById(deploymentId);
   if (!current) return null;
+  return findSimilarFor(current, options);
+}
+
+/**
+ * Stage 5: the same search for any change shaped like a deployment row -- a
+ * recorded deployment, or a pull request's files (id "0", never stored), so
+ * PR checks use exactly the same similarity rules and tenant boundary.
+ */
+export async function findSimilarFor(current: Deployment, options: SimilarityOptions = {}): Promise<SimilarityResult> {
 
   const minScore = options.minScore ?? DEFAULT_MIN_SCORE;
   const limit = options.limit ?? 10;
@@ -197,6 +209,10 @@ export async function findSimilarDeployments(
             probable_flake: flaky,
           }
         : null,
+      environments: {
+        status: row.environment_list?.length ? "found" : row.environments_status,
+        environments: (row.environment_list ?? []).map((e) => ({ name: e.name, state: e.state, at: null })),
+      },
       reverted_by: row.reverted_by_deployment_id
         ? { deployment_id: row.reverted_by_deployment_id, hours_after: Number(row.reverted_hours_after) }
         : null,

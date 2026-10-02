@@ -27,8 +27,13 @@ export type GitHubErrorKind =
   | "bad_request";
 
 export class GitHubApiError extends Error {
-  constructor(message: string, readonly status?: number, readonly kind: GitHubErrorKind = "unavailable") {
+  // Plain fields (not parameter properties) so Node's type stripping can load this module.
+  readonly status?: number;
+  readonly kind: GitHubErrorKind;
+  constructor(message: string, status?: number, kind: GitHubErrorKind = "unavailable") {
     super(message);
+    this.status = status;
+    this.kind = kind;
     this.name = "GitHubApiError";
   }
 }
@@ -159,6 +164,47 @@ export async function installationGet<T>(installationId: number, path: string): 
     if (!(error instanceof GitHubApiError) || error.kind !== "unauthorized") throw error;
     tokenCache.delete(installationId);
     return githubJson<T>(path, { token: await installationToken(installationId) });
+  }
+}
+
+/**
+ * Stage 5: a JSON write as an installation. Used ONLY for advisory check runs
+ * (POST /check-runs, PATCH /check-runs/{id}), which need "Checks: write".
+ */
+export async function installationSend<T>(installationId: number, method: "POST" | "PATCH", path: string, body: unknown): Promise<T> {
+  const init = (token: string) => ({ method, token, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  try {
+    return await githubJson<T>(path, init(await installationToken(installationId)));
+  } catch (error) {
+    if (!(error instanceof GitHubApiError) || error.kind !== "unauthorized") throw error;
+    tokenCache.delete(installationId);
+    return githubJson<T>(path, init(await installationToken(installationId)));
+  }
+}
+
+/**
+ * Stage 5: one file's text at a ref via the contents API, or null when it does
+ * not exist (404). Files over `maxBytes` are refused without being decoded.
+ */
+export async function getRepositoryFile(
+  installationId: number,
+  fullName: string,
+  path: string,
+  ref: string | null,
+  maxBytes: number
+): Promise<{ text: string; sha: string } | null> {
+  const query = ref ? `?ref=${encodeURIComponent(ref)}` : "";
+  try {
+    const file = await installationGet<{ type?: string; size?: number; encoding?: string; content?: string; sha?: string }>(
+      installationId,
+      `/repos/${fullName}/contents/${path.split("/").map(encodeURIComponent).join("/")}${query}`
+    );
+    if (file.type !== "file" || typeof file.content !== "string" || file.encoding !== "base64") return null;
+    if ((file.size ?? 0) > maxBytes) throw new GitHubApiError(`${path} is larger than ${maxBytes} bytes`, 413, "bad_request");
+    return { text: Buffer.from(file.content, "base64").toString("utf8"), sha: file.sha ?? "" };
+  } catch (error) {
+    if (error instanceof GitHubApiError && error.status === 404) return null;
+    throw error;
   }
 }
 

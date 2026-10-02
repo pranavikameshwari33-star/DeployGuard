@@ -57,10 +57,10 @@ const same = (a, b) => {
   }
 };
 
-/** [path, expected categories (canonical order), expected service or null] */
+/** [path, expected categories (canonical order), expected service or null]. Stage 5 added the finer categories. */
 const EXAMPLES = [
   ["README.md", ["documentation"], null],
-  ["package.json", ["dependencies"], null],
+  ["package.json", ["dependencies", "dependency_manifest"], null],
   ["config/database.yaml", ["database", "configuration"], "database"],
   ["src/auth/login.ts", ["application_code", "authentication"], null],
   ["payment-service/checkout.ts", ["application_code", "payments"], "payment-service"],
@@ -71,12 +71,12 @@ const EXAMPLES = [
   ["services/auth/login.ts", ["application_code", "authentication"], "auth"],
   ["frontend/components/Login.tsx", ["application_code", "authentication"], "frontend"],
   ["app/api/deployments/status/route.ts", ["application_code", "api"], null],
-  ["db/migrations/001_deployments.sql", ["database"], "database"],
-  ["k8s/deployment.yaml", ["infrastructure"], null],
-  ["terraform/main.tf", ["infrastructure"], null],
-  ["Dockerfile", ["infrastructure"], null],
-  ["docker-compose.yml", ["infrastructure"], null],
-  [".env.example", ["configuration"], null],
+  ["db/migrations/001_deployments.sql", ["database", "migration"], "database"],
+  ["k8s/deployment.yaml", ["infrastructure", "iac"], null],
+  ["terraform/main.tf", ["infrastructure", "iac"], null],
+  ["Dockerfile", ["infrastructure", "container"], null],
+  ["docker-compose.yml", ["infrastructure", "container"], null],
+  [".env.example", ["configuration", "environment"], null],
   ["next.config.ts", ["configuration"], null],
 ];
 

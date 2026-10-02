@@ -417,3 +417,4 @@ a:focus-visible, button:focus-visible, select:focus-visible {
 .history-revisions { font-size: 13px; }
 input:focus-visible, textarea:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
 .panel-head-inline { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.owners { font-size: 13px; margin-top: 8px; }

@@ -7,6 +7,7 @@ import {
 } from "@/lib/db/deployments";
 import { markProbableFlake, recordIncident, type IncidentResult } from "@/lib/db/incidents";
 import { recordRiskOutcome } from "@/lib/db/learning";
+import { queueEnvironmentsSync } from "@/lib/github/environments";
 import { enqueue } from "@/lib/jobs/queue";
 import { JOB_TYPES } from "@/lib/jobs/types";
 import { kickQueue } from "@/lib/jobs/runner";
@@ -151,6 +152,11 @@ export async function applyPipelineStatus(
   // ---------- refresh the risk analysis with the CI result (Phase 8) ----------
   // Only for deployments analysed on push, only for a final result. A repeated
   // report has the same evidence fingerprint and reuses the stored assessment.
+  // ---------- Stage 5.5: which environment did this commit go to? (owned, final results) ----------
+  if ((deployment.status === "SUCCESS" || deployment.status === "FAILED") && deployment.repository_id) {
+    await queueEnvironmentsSync(deployment.id);
+  }
+
   const riskRefreshScheduled =
     (deployment.status === "SUCCESS" || deployment.status === "FAILED") && deployment.risk_analysis_status !== null;
   if (riskRefreshScheduled) await scheduleRiskAnalysis(deployment.id, `ci ${deployment.status}`);

@@ -25,6 +25,8 @@ import {
   type Tone,
 } from "./format";
 import type { AccuracyRecord, FailurePattern, RevertFacts } from "@/lib/db/learning";
+import type { EnvironmentFacts } from "@/lib/db/environments";
+import type { InputsView, OwnersView, PullRequestCheckRow } from "@/lib/dashboard/dashboard-data";
 import type { AskResult } from "@/lib/learning/ask-history";
 import { SMALL_SAMPLE } from "@/lib/learning/accuracy";
 import type { Links } from "./links";
@@ -242,6 +244,7 @@ export function RiskPanel({
   links,
   canAct,
   memoryHref,
+  owners,
 }: {
   risk: RiskView;
   reanalyze: SelectedDeployment["reanalyze"];
@@ -249,6 +252,8 @@ export function RiskPanel({
   links: Links;
   canAct: boolean;
   memoryHref: string | null;
+  /** Stage 5.3 */
+  owners?: OwnersView;
 }) {
   if (risk.state !== "assessed") {
     const content =
@@ -274,6 +279,7 @@ export function RiskPanel({
         <div className="panel-body">
           <div className="state-box">{content}</div>
           <ReanalyzeArea reanalyze={reanalyze} deploymentId={deploymentId} canAct={canAct} />
+          {owners ? <OwnersBlock owners={owners} /> : null}
         </div>
       </Panel>
     );
@@ -443,6 +449,7 @@ export function RiskPanel({
           ) : null}
         </p>
         <ReanalyzeArea reanalyze={reanalyze} deploymentId={deploymentId} canAct={canAct} />
+        {owners ? <OwnersBlock owners={owners} /> : null}
       </div>
     </Panel>
   );
@@ -491,7 +498,33 @@ export function RecalledMemory({ data, links, closeHref }: { data: RecalledMemor
 
 const CHANGE_LABEL: Record<string, string> = { added: "Added", modified: "Modified", deleted: "Deleted" };
 
-export function ChangeAnalysis({ d }: { d: DashboardDeployment }) {
+/** Stage 5.3: who owns the changed files (CODEOWNERS), as recorded -- never inferred. */
+export function OwnersBlock({ owners }: { owners: OwnersView }) {
+  return (
+    <div className="owners">
+      <span className="label">Code owners of the changed files</span>{" "}
+      {owners.status !== "valid" ? (
+        <span className="faint">
+          {owners.status === "absent" ? "No CODEOWNERS file in this repository." : owners.status === "unavailable" ? "CODEOWNERS could not be read." : "CODEOWNERS not read yet."}
+        </span>
+      ) : owners.owners.length === 0 ? (
+        <span className="faint">No owner is listed for these files.</span>
+      ) : (
+        <span>
+          {owners.owners.map((o, i) => (
+            <span key={o.owner}>
+              {i ? ", " : ""}
+              {o.owner} <span className="faint">({o.files})</span>
+            </span>
+          ))}
+          {owners.unowned ? <span className="faint"> · {owners.unowned} file(s) without an owner</span> : null}
+        </span>
+      )}
+    </div>
+  );
+}
+
+export function ChangeAnalysis({ d, owners }: { d: DashboardDeployment; owners?: OwnersView }) {
   if (!d.file_analysis || !d.change_categories) {
     return (
       <Panel title="Change analysis" prov="observed">
@@ -524,6 +557,12 @@ export function ChangeAnalysis({ d }: { d: DashboardDeployment }) {
             )}
           </div>
         </div>
+        {d.file_analysis.some((f) => f.critical) ? (
+          <p className="note" role="note">
+            <Badge tone="amber">Critical path</Badge> {d.file_analysis.filter((f) => f.critical).length} file(s) match a critical path in .deployguard.yml.
+          </p>
+        ) : null}
+        {owners ? <OwnersBlock owners={owners} /> : null}
       </div>
       <div className="table-wrap bordered-top">
         <table className="data">
@@ -539,7 +578,11 @@ export function ChangeAnalysis({ d }: { d: DashboardDeployment }) {
           <tbody>
             {d.file_analysis.map((f) => (
               <tr key={f.path}>
-                <td className="wrap-any">{f.path}</td>
+                <td className="wrap-any">
+                  {f.path}
+                  {f.critical ? <span className="sub">critical path</span> : null}
+                  {f.ignored ? <span className="sub">ignored by .deployguard.yml</span> : null}
+                </td>
                 <td className="nowrap">{CHANGE_LABEL[f.change_type] ?? f.change_type}</td>
                 <td>{f.categories.map(categoryLabel).join(", ")}</td>
                 <td className="nowrap">{f.service ?? <span className="faint">—</span>}</td>
@@ -573,11 +616,14 @@ export function PipelinePanel({
   incident,
   reverts,
   links,
+  environments,
 }: {
   d: DashboardDeployment;
   incident: Incident | null;
   reverts?: RevertFacts;
   links: Links;
+  /** Stage 5.5 */
+  environments?: EnvironmentFacts;
 }) {
   const s = d.status;
   const building: "done" | "active" | "waiting" = s === "BUILDING" ? "active" : s === "RECEIVED" ? "waiting" : "done";
@@ -606,6 +652,26 @@ export function PipelinePanel({
               <span className="faint">{s === "RECEIVED" ? "Not started" : "Not reported"}</span>
             )}
           </dd>
+          {environments ? (
+            <>
+              <dt>Environment</dt>
+              <dd>
+                {environments.status === "found" && environments.environments.length ? (
+                  environments.environments.map((e, i) => (
+                    <span key={`${e.name}${i}`}>
+                      {i ? ", " : ""}
+                      {e.name}: {e.state ?? "state not reported"}
+                    </span>
+                  ))
+                ) : (
+                  <span className="faint">
+                    Environment unknown
+                    {environments.status === "unavailable" ? " (GitHub deployments could not be read)" : environments.status === "none" ? " (GitHub reported no deployment of this commit)" : ""}
+                  </span>
+                )}
+              </dd>
+            </>
+          ) : null}
           <dt>Started</dt>
           <dd>{d.ci_started_at ? absoluteTime(d.ci_started_at) : <span className="faint">—</span>}</dd>
           <dt>Finished</dt>
@@ -706,6 +772,7 @@ export function HistoricalEvidence({ evidence, links }: { evidence: SelectedDepl
                   </td>
                   <td>
                     <Badge tone={statusTone(m.status)}>{m.status}</Badge>
+                    {m.environments?.length ? <span className="sub">{m.environments.join(", ")}</span> : null}
                   </td>
                   <td className="col-msg">
                     {m.commit_message}
@@ -844,6 +911,7 @@ export function DeploymentHistory({
                   <Badge tone={statusTone(r.status)}>{r.status}</Badge>
                   {r.probable_flake ? <span className="sub">failed first; probable flake</span> : null}
                   {r.reverted ? <span className="sub">reverted</span> : null}
+                  {r.environments.length ? <span className="sub">{r.environments.join(", ")}</span> : null}
                 </td>
                 <td>
                   <Time iso={r.created_at} />
@@ -1283,6 +1351,95 @@ export function AskHistory({ result, repo, links }: { result: AskResult | null; 
             </p>
           </div>
         )}
+      </div>
+    </Panel>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5: repository inputs (.deployguard.yml, CODEOWNERS) and PR checks
+// ---------------------------------------------------------------------------
+
+const CONFIG_TEXT: Record<InputsView["configStatus"], string> = {
+  valid: "Valid. Its rules shape the change analysis.",
+  absent: "No .deployguard.yml on the default branch; defaults apply.",
+  invalid: "Invalid, so it is NOT used; defaults apply until it is fixed.",
+  unavailable: "Could not be read from GitHub; defaults apply.",
+  not_read: "Not read yet; it is read after the next push.",
+};
+
+const PR_STATE_TEXT: Record<string, string> = {
+  posted: "Check posted",
+  pending: "Running",
+  disabled: "Disabled",
+  permission_missing: "Permission missing",
+  failed: "Failed",
+};
+
+export function RepositoryInputs({ inputs, prChecks }: { inputs: InputsView; prChecks: PullRequestCheckRow[] }) {
+  const c = inputs.config;
+  return (
+    <Panel title="Repository inputs" id="inputs" prov="observed">
+      <div className="panel-body">
+        <dl className="facts">
+          <dt>.deployguard.yml</dt>
+          <dd>
+            <Badge tone={inputs.configStatus === "valid" ? "green" : inputs.configStatus === "invalid" ? "red" : "gray"}>{inputs.configStatus.replace("_", " ")}</Badge>{" "}
+            {CONFIG_TEXT[inputs.configStatus]}
+          </dd>
+          {c ? (
+            <>
+              <dt>Rules</dt>
+              <dd>
+                {c.critical.length} critical path(s), {c.ignore.length} ignore pattern(s), {c.services.length} service mapping(s), {c.categories.length} category rule(s); PR checks {c.pull_request_checks ? "on" : "off"}.
+              </dd>
+            </>
+          ) : null}
+          <dt>This deployment</dt>
+          <dd>
+            {inputs.appliedToDeployment
+              ? `Analysed with config status "${inputs.appliedToDeployment.status.replace(/_/g, " ")}"${inputs.appliedToDeployment.sha ? ` (file ${inputs.appliedToDeployment.sha.slice(0, 7)})` : ""}.`
+              : "Analysed before repository config existed."}
+          </dd>
+          <dt>CODEOWNERS</dt>
+          <dd>
+            {inputs.codeownersStatus === "valid" ? `Read from ${inputs.codeownersPath}.` : inputs.codeownersStatus === "absent" ? "None found." : inputs.codeownersStatus === "unavailable" ? "Could not be read." : "Not read yet."}
+            {inputs.emailsDropped ? <span className="faint"> {inputs.emailsDropped} email owner(s) are not shown.</span> : null}
+          </dd>
+          {inputs.fetchedAt ? (
+            <>
+              <dt>Read</dt>
+              <dd>{absoluteTime(inputs.fetchedAt)}</dd>
+            </>
+          ) : null}
+        </dl>
+        {inputs.configErrors.length ? (
+          <div role="alert">
+            <span className="label">Config errors</span>
+            <ul className="plain-list">
+              {inputs.configErrors.map((e, i) => (
+                <li key={i}>{e}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+        <div>
+          <span className="label">Recent pull request checks (advisory, never blocking)</span>
+          {prChecks.length === 0 ? (
+            <p className="muted small">None yet. They appear when a pull request is opened or updated.</p>
+          ) : (
+            <ul className="plain-list">
+              {prChecks.map((p) => (
+                <li key={`${p.pr_number}-${p.head_sha}`}>
+                  PR #{p.pr_number} <span className="num">{shortSha(p.head_sha)}</span> · {PR_STATE_TEXT[p.state] ?? p.state}
+                  {p.risk_level ? <> · <Badge tone={riskTone(p.risk_level as "LOW" | "MEDIUM" | "HIGH")}>{p.risk_level}</Badge></> : null}
+                  {p.detail ? <span className="faint"> · {p.detail}</span> : null}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <p className="footnote">DeployGuard reads these files as data from the default branch; it never runs anything from them.</p>
       </div>
     </Panel>
   );

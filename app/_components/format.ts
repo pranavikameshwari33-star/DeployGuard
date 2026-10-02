@@ -61,6 +61,12 @@ const CATEGORY_LABELS: Record<string, string> = {
   tests: "Tests",
   documentation: "Documentation",
   dependencies: "Dependencies",
+  migration: "Migration",
+  lockfile: "Lockfile",
+  dependency_manifest: "Dependency manifest",
+  iac: "Infrastructure as code",
+  container: "Container",
+  environment: "Environment config",
   unknown: "Unknown",
 };
 

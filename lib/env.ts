@@ -70,6 +70,21 @@ export const env = {
   // --- Stage 4: learning (optional, with defaults) ---
   /** Hours after a deployment in which a revert commit is attached to it; 0 = revert detection off. */
   revertWindowHours: () => intOption("DEPLOYGUARD_REVERT_WINDOW_HOURS", 72),
+
+  // --- Stage 5: better inputs (optional, with defaults) ---
+  /** Global switch for advisory pull request checks ("off" disables them everywhere; per repo: .deployguard.yml). */
+  pullRequestChecksEnabled: () => optional("DEPLOYGUARD_PR_CHECKS", "on").toLowerCase() !== "off",
+  /** Public https origin of the dashboard, used to link deployments from check runs. Not a secret. */
+  dashboardBaseUrl: (): string | null => {
+    const raw = process.env.DEPLOYGUARD_BASE_URL?.trim();
+    if (!raw) return null;
+    try {
+      const url = new URL(raw);
+      return url.protocol === "https:" && !url.username && !url.password ? url.origin : null;
+    } catch {
+      return null;
+    }
+  },
 };
 
 function intOption(name: string, fallback: number): number {

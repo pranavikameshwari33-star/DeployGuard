@@ -18,6 +18,11 @@ import {
 import { toEvidenceMatch } from "@/lib/risk/evidence";
 import type { EvidenceMatch, RiskLevel } from "@/lib/risk/validate";
 import { findSimilarDeployments } from "@/lib/similarity/find-similar";
+import { getPool } from "@/lib/db/client";
+import { getEnvironments, type EnvironmentFacts } from "@/lib/db/environments";
+import { ownersOfFiles } from "@/lib/config/codeowners";
+import type { RepoConfig } from "@/lib/config/repo-config";
+import { getRepositoryInputs, type RepositoryInputs } from "@/lib/github/repo-inputs";
 import {
   findFailurePatterns,
   flakyDeploymentIds,
@@ -97,11 +102,46 @@ export type SelectedDeployment = {
   incident: Incident | null;
   /** Stage 4.5: observed reverts of / by this deployment. */
   reverts: RevertFacts;
+  /** Stage 5: repository inputs, code owners of the changed files, environments, recent PR checks. */
+  inputs: InputsView;
+  owners: OwnersView;
+  environments: EnvironmentFacts;
+  prChecks: PullRequestCheckRow[];
   evidence: {
     /** "assessment": exactly what the risk analysis saw. "database": current structured matches (no analysis yet). */
     source: "assessment" | "database";
     matches: EvidenceMatch[];
   };
+};
+
+/** Stage 5.2: what the dashboard says about .deployguard.yml and CODEOWNERS (no raw file content). */
+export type InputsView = {
+  configStatus: "absent" | "valid" | "invalid" | "unavailable" | "not_read";
+  configErrors: string[];
+  config: RepoConfig | null;
+  fetchedAt: string | null;
+  /** The config status/sha recorded when THIS deployment was analysed. */
+  appliedToDeployment: { status: string; sha: string | null } | null;
+  codeownersStatus: "absent" | "valid" | "unavailable" | "not_read";
+  codeownersPath: string | null;
+  emailsDropped: number;
+};
+
+/** Stage 5.3: owners of the changed files, from the repository's CODEOWNERS. */
+export type OwnersView = {
+  status: InputsView["codeownersStatus"];
+  owners: { owner: string; files: number }[];
+  unowned: number;
+};
+
+export type PullRequestCheckRow = {
+  pr_number: number;
+  head_sha: string;
+  title: string | null;
+  state: string;
+  detail: string | null;
+  risk_level: string | null;
+  updated_at: string;
 };
 
 export type HistoryRow = {
@@ -119,6 +159,8 @@ export type HistoryRow = {
   /** Stage 4: the failure was a probable flake / the deployment was reverted. */
   probable_flake: boolean;
   reverted: boolean;
+  /** Stage 5.5: "production: success", ... ; empty = environment unknown. */
+  environments: string[];
 };
 
 export type DashboardData = {
@@ -134,6 +176,19 @@ export type DashboardData = {
   /** Stage 4: what DeployGuard has learned in this scope (PostgreSQL only). */
   learning: { patterns: FailurePattern[]; accuracy: AccuracyRecord; windowDays: number };
 };
+
+/** Stage 5.5: environment labels of the given deployments. */
+async function environmentsOf(ids: string[]): Promise<Map<string, string[]>> {
+  if (ids.length === 0) return new Map();
+  const { rows } = await getPool().query<{ id: string; label: string }>(
+    `SELECT deployment_id::text AS id, environment || ': ' || COALESCE(state, 'state not reported') AS label
+     FROM deployment_environments WHERE deployment_id = ANY($1::bigint[]) ORDER BY environment`,
+    [ids]
+  );
+  const map = new Map<string, string[]>();
+  for (const r of rows) map.set(r.id, [...(map.get(r.id) ?? []), r.label]);
+  return map;
+}
 
 /** Stage 4.3: recurring failure patterns are looked for in this many days. */
 export const PATTERN_WINDOW_DAYS = 60;
@@ -165,7 +220,12 @@ export async function getDashboardData(
   ]);
   const recent = page.slice(0, limit);
   const ids = recent.map((d) => d.id);
-  const [levels, flaky, reverted] = await Promise.all([getLatestRiskLevels(ids), flakyDeploymentIds(ids), revertedDeploymentIds(ids)]);
+  const [levels, flaky, reverted, envs] = await Promise.all([
+    getLatestRiskLevels(ids),
+    flakyDeploymentIds(ids),
+    revertedDeploymentIds(ids),
+    environmentsOf(ids),
+  ]);
 
   const history: HistoryRow[] = recent.map((d) => ({
     id: d.id,
@@ -181,6 +241,7 @@ export async function getDashboardData(
     created_at: d.created_at.toISOString(),
     probable_flake: flaky.has(d.id),
     reverted: reverted.has(d.id),
+    environments: envs.get(d.id) ?? [],
   }));
 
   let current: Deployment | null = null;
@@ -208,11 +269,19 @@ export async function getDashboardData(
 
 async function describe(d: Deployment): Promise<SelectedDeployment> {
   // Stage 4.4: a deployment that passed on a re-run keeps its incident (probable flake), so load it for any status.
-  const [assessment, incident, reverts] = await Promise.all([
+  const [assessment, incident, reverts, repoInputs, environments, prChecks] = await Promise.all([
     getLatestAssessment(d.id),
     getIncidentForDeployment(d.id),
     getRevertFacts(d.id),
+    getRepositoryInputs(d.github_repository_id),
+    getEnvironments(d.id),
+    listPullRequestChecks(d.github_repository_id, 5),
   ]);
+  const inputs = inputsView(repoInputs, d);
+  const owners: OwnersView =
+    repoInputs?.codeowners_status === "valid" && repoInputs.codeowners
+      ? { status: "valid", ...ownersOfFiles(d.changed_files, repoInputs.codeowners) }
+      : { status: inputs.codeownersStatus, owners: [], unowned: 0 };
 
   // Historical evidence: exactly what the risk analysis saw, when there is one.
   // Otherwise the current structured matches -- database only, no Hindsight.
@@ -225,7 +294,41 @@ async function describe(d: Deployment): Promise<SelectedDeployment> {
   }
 
   const risk = riskView(d, assessment);
-  return { deployment: toDashboardDeployment(d), risk, incident, reverts, evidence, reanalyze: reanalyzeOffer(d, risk) };
+  return {
+    deployment: toDashboardDeployment(d),
+    risk,
+    incident,
+    reverts,
+    inputs,
+    owners,
+    environments,
+    prChecks,
+    evidence,
+    reanalyze: reanalyzeOffer(d, risk),
+  };
+}
+
+function inputsView(r: RepositoryInputs | null, d: Deployment): InputsView {
+  return {
+    configStatus: r?.config_status ?? "not_read",
+    configErrors: r?.config_errors ?? [],
+    config: r?.config_status === "valid" ? r.config : null,
+    fetchedAt: r?.fetched_at?.toISOString() ?? null,
+    appliedToDeployment: d.analysis_config,
+    codeownersStatus: r?.codeowners_status ?? "not_read",
+    codeownersPath: r?.codeowners_path ?? null,
+    emailsDropped: r?.codeowners_emails_dropped ?? 0,
+  };
+}
+
+async function listPullRequestChecks(githubRepositoryId: string | null, limit: number): Promise<PullRequestCheckRow[]> {
+  if (!githubRepositoryId) return [];
+  const { rows } = await getPool().query<PullRequestCheckRow & { updated_at: Date }>(
+    `SELECT pr_number, head_sha, title, state, detail, risk_level, updated_at
+     FROM pull_request_checks WHERE github_repository_id = $1 ORDER BY updated_at DESC LIMIT $2`,
+    [githubRepositoryId, limit]
+  );
+  return rows.map((r) => ({ ...r, updated_at: r.updated_at.toISOString() }));
 }
 
 function reanalyzeOffer(d: Deployment, risk: RiskView): SelectedDeployment["reanalyze"] {

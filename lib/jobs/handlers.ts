@@ -10,6 +10,9 @@ import { processWorkflowRun } from "@/lib/github/app-events";
 import { reconcileInstallation } from "@/lib/github/installations";
 import { runRiskAnalysis } from "@/lib/risk/auto-risk";
 import { runReevaluation } from "@/lib/learning/confirm-incident";
+import { refreshRepositoryInputs } from "@/lib/github/repo-inputs";
+import { processPullRequestEvent } from "@/lib/github/pull-request-check";
+import { processDeploymentStatusEvent, syncEnvironments } from "@/lib/github/environments";
 
 /**
  * Stage 2: what each job type does. Every handler is idempotent -- running it
@@ -80,6 +83,35 @@ export const handlers: Record<string, Handler> = {
     if (!Number.isInteger(revision) || revision < 1) throw new PermanentJobError("job payload has an invalid revision");
     return runReevaluation(str(job, "incidentId"), revision);
   },
+
+  /** Stage 5.2/5.3: re-read .deployguard.yml and CODEOWNERS (default branch). */
+  [JOB_TYPES.repoInputsRefresh]: async (job) => refreshRepositoryInputs(str(job, "githubRepositoryId")),
+
+  /** Stage 5.1: advisory PR check. Payload from the delivery log; idempotent (check run updated, assessment reused). */
+  [JOB_TYPES.pullRequestCheck]: async (job) => {
+    const deliveryId = str(job, "deliveryId");
+    const payload = await getDeliveryPayload(deliveryId);
+    if (!payload) return "delivery already processed (payload cleared)";
+    const result = await processPullRequestEvent(payload as Parameters<typeof processPullRequestEvent>[0]);
+    await finishDelivery(deliveryId, result.startsWith("ignored") ? "ignored" : "processed");
+    return result;
+  },
+
+  /** Stage 5.5: a deployment_status event -> environment of the matching deployment(s). */
+  [JOB_TYPES.deploymentStatus]: async (job) => {
+    const deliveryId = str(job, "deliveryId");
+    const payload = await getDeliveryPayload(deliveryId);
+    if (!payload) return "delivery already processed (payload cleared)";
+    const result = await processDeploymentStatusEvent(payload as Parameters<typeof processDeploymentStatusEvent>[0]);
+    if (result.startsWith("no DeployGuard deployment") && job.attempts < job.max_attempts) {
+      throw new RetryableJobError(result); // the push may not be recorded yet
+    }
+    await finishDelivery(deliveryId, result.startsWith("ignored") ? "ignored" : "processed");
+    return result;
+  },
+
+  /** Stage 5.5: ask the Deployments API about one deployment's commit. */
+  [JOB_TYPES.environmentsSync]: async (job) => syncEnvironments(str(job, "deploymentId")),
 
   /** Re-reads an installation and its repositories from GitHub (e.g. after unsuspend). */
   [JOB_TYPES.installationReconcile]: async (job) => {

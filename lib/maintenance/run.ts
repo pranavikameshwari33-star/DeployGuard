@@ -138,8 +138,10 @@ export async function runMaintenance(options: { budgetMs?: number } = {}): Promi
   });
   await step("orphaned deliveries", async () => {
     for (const d of await listOrphanedDeliveries(LIMITS.deliveries)) {
-      if (d.event !== "workflow_run") continue;
-      await enqueue(JOB_TYPES.workflowRun, { deliveryId: d.delivery_id }, { dedupeKey: `webhook:${d.delivery_id}`, maxAttempts: 8 });
+      // Stage 5: pull_request and deployment_status deliveries are deferred too.
+      const type = ({ workflow_run: JOB_TYPES.workflowRun, pull_request: JOB_TYPES.pullRequestCheck, deployment_status: JOB_TYPES.deploymentStatus } as Record<string, string>)[d.event];
+      if (!type) continue;
+      await enqueue(type, { deliveryId: d.delivery_id }, { dedupeKey: `webhook:${d.delivery_id}`, maxAttempts: 8 });
       report.deliveriesRequeued.push(d.delivery_id);
     }
   });

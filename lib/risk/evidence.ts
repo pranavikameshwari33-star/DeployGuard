@@ -1,8 +1,9 @@
 import crypto from "node:crypto";
 import { getDeploymentById, type Deployment } from "@/lib/db/deployments";
 import { getIncidentForDeployment, type Incident } from "@/lib/db/incidents";
-import { getRevertFacts } from "@/lib/db/learning";
-import { findSimilarDeployments, type HistoricalEvidence } from "@/lib/similarity/find-similar";
+import { getRevertFacts, type RevertFacts } from "@/lib/db/learning";
+import { getEnvironments, type EnvironmentFacts } from "@/lib/db/environments";
+import { findSimilarDeployments, type HistoricalEvidence, type SimilarityResult } from "@/lib/similarity/find-similar";
 import type { EvidenceFailure, EvidenceIncident, EvidenceMatch, RiskEvidence } from "@/lib/risk/validate";
 import { redactDeep } from "@/lib/security/redact";
 import { MODEL_FIELD_LIMITS as L, sanitizeForModel, sanitizeNullable } from "@/lib/security/untrusted";
@@ -37,12 +38,28 @@ export async function buildRiskEvidence(deploymentId: string): Promise<RiskEvide
   const deployment = await getDeploymentById(deploymentId);
   if (!deployment) return null;
 
-  const [similar, incident, reverts] = await Promise.all([
+  const [similar, incident, reverts, environments] = await Promise.all([
     findSimilarDeployments(deploymentId),
     deployment.status === "FAILED" ? getIncidentForDeployment(deploymentId) : Promise.resolve(null),
     getRevertFacts(deploymentId),
+    getEnvironments(deploymentId),
   ]);
   if (!similar) return null;
+  return assembleEvidence(deployment, similar, incident, reverts, { environments });
+}
+
+/**
+ * Stage 5: the bundle from already-gathered facts. Used for deployments
+ * (above) and for pull requests (lib/github/pull-request-check.ts), which pass
+ * `pullRequest` so the bundle says plainly that nothing has been deployed.
+ */
+export function assembleEvidence(
+  deployment: Deployment,
+  similar: SimilarityResult,
+  incident: Incident | null,
+  reverts: RevertFacts,
+  extra: { environments?: EnvironmentFacts; pullRequest?: { number: number; base_ref: string | null } } = {}
+): RiskEvidenceResult {
 
   const matches: EvidenceMatch[] = similar.matches.map(toEvidenceMatch);
 
@@ -64,6 +81,10 @@ export async function buildRiskEvidence(deploymentId: string): Promise<RiskEvide
       deleted_files: deployment.deleted_files,
       reverts: reverts.reverts && { deployment_id: reverts.reverts.deployment_id, hours_after: reverts.reverts.hours_after },
       reverted_by: reverts.reverted_by && { deployment_id: reverts.reverted_by.deployment_id, hours_after: reverts.reverted_by.hours_after },
+      // Stage 5.5: where it was deployed, per GitHub's Deployments API -- or "environment unknown".
+      environments: extra.environments ? environmentView(extra.environments) : undefined,
+      // Stage 5.2: files under a configured critical path.
+      critical_files: (deployment.file_analysis ?? []).filter((f) => f.critical).map((f) => f.path),
     },
     change_analysis: {
       change_categories: similar.deployment.change_categories,
@@ -77,7 +98,9 @@ export async function buildRiskEvidence(deploymentId: string): Promise<RiskEvide
     },
     current_pipeline: {
       status: deployment.status,
-      state: pipelineState(deployment),
+      state: extra.pullRequest
+        ? "pull request: not merged and not deployed; no CI result of this change is included"
+        : pipelineState(deployment),
       ci_run_url: deployment.ci_run_url,
       started_at: deployment.ci_started_at?.toISOString() ?? null,
       finished_at: deployment.ci_finished_at?.toISOString() ?? null,
@@ -94,6 +117,12 @@ export async function buildRiskEvidence(deploymentId: string): Promise<RiskEvide
       matches,
     },
     evidence_notes: [
+      ...(extra.pullRequest
+        ? [
+            "This bundle describes an open PULL REQUEST, not a deployment. Refer to it only as \"this pull request\" -- never by a number. current_deployment.deployment_id is a placeholder.",
+          ]
+        : []),
+      "current_deployment.environments lists the GitHub deployment environments of this commit; \"environment unknown\" means GitHub reported none or could not be asked. Do not assume production. Each historical match has its own environments; do not treat staging and production outcomes as the same history.",
       "historical_evidence.matches is the COMPLETE list of past deployments available for this analysis. No other deployments exist for you.",
       "similarity_score is DeployGuard's rule-based ranking heuristic (see matched_signals). It is not a probability.",
       "root_cause, resolution = null means NOT KNOWN. Do not fill them in or guess them.",
@@ -150,6 +179,8 @@ export function protectEvidence(e: RiskEvidence): RiskEvidence {
       commit_message: sanitizeForModel(e.current_deployment.commit_message, L.commitMessage),
       author: sanitizeForModel(e.current_deployment.author, L.author),
       added_files: e.current_deployment.added_files.map(path),
+      ...(e.current_deployment.environments ? { environments: e.current_deployment.environments.map((x) => sanitizeForModel(x, L.short)) } : {}),
+      ...(e.current_deployment.critical_files ? { critical_files: e.current_deployment.critical_files.map(path) } : {}),
       modified_files: e.current_deployment.modified_files.map(path),
       deleted_files: e.current_deployment.deleted_files.map(path),
     },
@@ -173,6 +204,7 @@ export function protectEvidence(e: RiskEvidence): RiskEvidence {
         failure: failure(m.failure),
         incident: incident(m.incident),
         matched_signals: m.matched_signals.map((x) => sanitizeForModel(x, L.short)),
+        ...(m.environments ? { environments: m.environments.map((x) => sanitizeForModel(x, L.short)) } : {}),
       })),
     },
   };
@@ -196,7 +228,14 @@ export function toEvidenceMatch(m: HistoricalEvidence): EvidenceMatch {
     relevance: m.relevance,
     matched_signals: m.matched_signals.map((s) => `${s.signal}: ${s.value} (+${s.points})`),
     reverted_by: m.reverted_by,
+    environments: environmentView(m.environments),
   };
+}
+
+/** Stage 5.5: environments as short strings ("production: success"), or the explicit unknown. */
+export function environmentView(e: EnvironmentFacts | undefined): string[] {
+  if (!e || e.status !== "found" || e.environments.length === 0) return ["environment unknown"];
+  return e.environments.map((x) => `${x.name}: ${x.state ?? "state not reported"}`);
 }
 
 /** What CI has told us so far, in words that cannot be mistaken for a result. */
