@@ -1,23 +1,99 @@
 # DeployGuard — AI DevOps Pipeline Agent
 
-An agent that watches deployments, remembers past failures, compares new changes
-against that history, and warns about risk before production.
+An AI-powered DevOps pipeline agent that connects to authorized GitHub repositories, monitors
+deployments and GitHub Actions, remembers historical failures, analyzes changes, identifies
+similar past deployments, and predicts deployment risk with explainable evidence.
 
-**WATCH → REMEMBER → COMPARE → PREDICT → EXPLAIN → LEARN**
+**WATCH → REMEMBER → COMPARE → PREDICT → EXPLAIN → RECOVER**
+
+DeployGuard observes and explains. It does not block, approve, roll back or change
+deployments on its own.
 
 ---
 
-## Status
+## How DeployGuard works
+
+```
+GitHub account
+  → authorized repository
+  → GitHub push
+  → deployment ingestion
+  → change analysis
+  → historical similarity
+  → Gemini risk analysis
+  → GitHub Actions monitoring
+  → incident memory
+  → risk refresh
+  → dashboard
+```
+
+1. **GitHub account.** You sign in with GitHub. DeployGuard keys your account on your
+   immutable GitHub user id and keeps its own session; GitHub tokens are not stored.
+2. **Authorized repository.** You install the DeployGuard GitHub App and choose which
+   repositories it may see (read-only: Metadata, Contents, Actions). Only those
+   repositories are monitored, and each user sees only their own.
+3. **GitHub push.** GitHub sends the push to `POST /api/webhook/github`. The HMAC signature
+   is verified before anything else happens; duplicate deliveries are recognised and skipped.
+4. **Deployment ingestion.** The push becomes one row in PostgreSQL (the source of truth),
+   owned by its connected repository, plus a memory in Hindsight.
+5. **Change analysis.** Changed file paths are classified with fixed, deterministic rules
+   (database, configuration, authentication, payments, API, infrastructure, CI/CD, tests,
+   documentation, dependencies, application code, unknown) and mapped to the
+   services/components the folder structure names. No AI is used for this step.
+6. **Historical similarity.** Earlier deployments of the same repository are ranked by
+   explicit signals — shared files, components and categories, similar commit messages,
+   failure type — with Hindsight recall as a supporting signal. Every match says why it
+   matched and what happened to it.
+7. **Gemini risk analysis.** Gemini receives only this evidence bundle and returns a
+   structured LOW / MEDIUM / HIGH assessment with reasons, cited deployments, recommended
+   checks and missing information. The answer is validated (for example, it may only cite
+   deployments it was given, with their recorded outcome) before it is stored; an invalid or
+   failed answer is reported as "unavailable" instead of inventing a risk level. It runs
+   automatically after the push, without delaying the webhook.
+8. **GitHub Actions monitoring.** `workflow_run` events for push-triggered workflows move
+   the deployment through `RECEIVED → BUILDING → SUCCESS | FAILED`. A failure records the
+   failed job, step and the end of its log, as GitHub reported them.
+9. **Incident memory.** A failed deployment creates one incident with the observed failure.
+   Root cause, resolution and downstream effect stay empty until they are actually known.
+10. **Risk refresh.** Once the pipeline result arrives, the risk analysis is refreshed with
+    that new evidence. Unchanged evidence reuses the stored assessment instead of calling
+    Gemini again.
+11. **Dashboard.** `/` shows your current deployment, its risk and reasons, the change
+    analysis, pipeline state, historical evidence, deployment and incident history, and
+    your connected repositories. Loading it never calls Gemini.
+
+A maintenance run (`/api/maintenance/run`, internal-only) repairs what missed events leave
+behind: it re-syncs installations and repositories, recovers pushes and pipeline results
+that never arrived, retries unfinished work and resumes interrupted risk analyses.
+
+---
+
+## Roadmap / status
+
+Built incrementally; each phase extended the previous ones rather than replacing them.
 
 - [x] Phase 1 — GitHub push detection
 - [x] Phase 2 — Store deployment events + Hindsight memory
-- [x] **Phase 3 — GitHub Actions pipeline monitoring** (current)
-- [ ] Phase 4 — Incident memory
-- [ ] Phase 5 — Detect affected components
-- [ ] Phase 6 — Historical similarity
-- [ ] Phase 7 — Gemini risk analysis
-- [ ] Phase 8 — Dashboard
-- [ ] Phase 9 — Learning loop
+- [x] Phase 3 — GitHub Actions pipeline monitoring
+- [x] Phase 4 — Incident memory
+- [x] Phase 5 — Detect affected components
+- [x] Phase 6 — Historical similarity
+- [x] Phase 7 — Gemini risk analysis
+- [x] Phase 8 — Automatic risk analysis + Dashboard
+- [x] Phase 9 — GitHub authentication + repository connection + multi-user isolation
+- [x] Phase 10 — Reliability + security hardening
+
+**Still open:**
+
+- The real browser round-trip (GitHub sign-in → App installation → real push → real
+  GitHub Actions run) has not yet been tested end to end; it is covered only by local
+  verification scripts that simulate GitHub.
+- `DEPLOYGUARD_STATUS_TOKEN` currently serves both CI status reporting and internal
+  maintenance/admin access. Splitting it into a separate internal token is pending.
+
+The sections below document the pipeline from the ground up, in the order it was built.
+Since Phase 9, browser-facing endpoints require a signed-in session (or internal tooling),
+and each user only sees data for their own connected repositories.
 
 ---
 
@@ -26,8 +102,8 @@ against that history, and warns about risk before production.
 | Route | Purpose |
 | --- | --- |
 | `POST /api/webhook/github` | Receives GitHub push events. Verifies the signature, normalizes the payload, records it. |
-| `GET /api/events` | Shows the push events received since the server started. Your verification window. |
-| `GET /` | Minimal status page. |
+| `GET /api/events` | Shows the push events received since the server started. Internal tooling only since Phase 9. |
+| `GET /` | The dashboard (Phase 8); redirects to `/login` when you are not signed in. |
 
 Push events are also printed as a readable block in the terminal running `npm run dev`.
 
@@ -57,10 +133,10 @@ Phase 6 finds candidate history, Phase 7 makes Gemini justify its risk score aga
 | Route | Purpose |
 | --- | --- |
 | `POST /api/webhook/github` | Verify, store in Postgres, then store in Hindsight. |
-| `GET /api/deployments` | The `deployments` table, newest first. |
-| `GET /api/memory/recall?q=...` | Ask Hindsight what it remembers, in plain English. |
-| `POST /api/memory/backfill` | Re-store memories for recent deployments after a Hindsight outage. |
-| `GET /api/events` | Raw in-memory receipt log. Still works when the database is down, which is what makes it useful for diagnosis. |
+| `GET /api/deployments` | The `deployments` table, newest first — only your own repositories' deployments. |
+| `GET /api/memory/recall?q=...` | Ask Hindsight what it remembers, in plain English — restricted to your own repositories' memories. |
+| `POST /api/memory/backfill` | Re-store memories for recent deployments after a Hindsight outage. Internal tooling only. |
+| `GET /api/events` | Raw in-memory receipt log. Still works when the database is down, which is what makes it useful for diagnosis. Internal tooling only. |
 
 ### Database setup
 
@@ -241,7 +317,8 @@ npm run test:webhook
 
 This sends a fake-but-correctly-signed push event to your local server. You should see
 `Status: 200` in that terminal and a `PUSH RECEIVED` block in the dev-server terminal.
-Then open http://localhost:3000/api/events to see the stored event.
+The push is recorded without an owner (it did not come through the GitHub App), so it is
+not shown on a signed-in user's dashboard.
 
 ---
 
@@ -296,8 +373,11 @@ git commit --allow-empty -m "test deployguard webhook"
 git push
 ```
 
-Watch the dev-server terminal for the `PUSH RECEIVED` block, then refresh
-`http://localhost:3000/api/events`.
+Watch the dev-server terminal for the `PUSH RECEIVED` block.
+
+> This section describes a plain repository webhook, which records deployments without an
+> owner. For signed-in, per-user monitoring, point the **GitHub App's** webhook URL at the
+> same `https://<your-ngrok-url>/api/webhook/github` endpoint instead.
 
 **If nothing arrives**, open **Settings → Webhooks → your webhook → Recent Deliveries** in
 GitHub. Each delivery shows the request, the response code, and a **Redeliver** button so
@@ -316,29 +396,40 @@ you can retry without pushing again.
 
 ```
 app/
-  api/webhook/github/route.ts   the webhook endpoint
-  api/events/route.ts           verification endpoint
-  page.tsx, layout.tsx          minimal status page
+  page.tsx, layout.tsx, _components/  the dashboard (Open Sans, server-rendered)
+  login/page.tsx                sign-in page
+  auth/github/...               GitHub sign-in, App installation callback, logout (auth/logout)
+  api/webhook/github/route.ts   the single GitHub webhook endpoint (push, workflow_run, installation events)
+  api/deployments/...           deployments, CI status updates, similar deployments, risk analysis
+  api/dashboard/route.ts        dashboard data as JSON
+  api/repositories/route.ts     your connected repositories
+  api/memory/...                Hindsight recall and backfill
+  api/maintenance/run/route.ts  reconciliation / recovery run (internal only)
+  api/health/route.ts           health check
+  api/events/route.ts           raw push receipt log (internal only)
+proxy.ts                        sends signed-out visitors of / to /login
 lib/
-  github/verify-signature.ts    HMAC-SHA256 signature check
-  github/parse-push-event.ts    raw GitHub payload -> PushEvent
-  store/event-store.ts          in-memory receipt log
   env.ts                        the only place secrets are read
-  db/client.ts                  shared PostgreSQL pool
-  db/deployments.ts             deployments table reads/writes
-  hindsight/client.ts           retain + recall over the Hindsight REST API
-  hindsight/deployment-memory.ts  deployment row -> recallable memory
-db/migrations/
-  001_deployments.sql           the deployments table
-  api/deployments/status/route.ts  pipeline status updates from GitHub Actions
-  db/migrations/002_pipeline_status.sql  pipeline columns
+  auth/                         sessions, bearer-token check, rate limiting
+  github/                       signature check, push parsing, GitHub App client, App events, installations
+  db/                           PostgreSQL pool and table reads/writes
+  analysis/change-analysis.ts   deterministic change classification
+  similarity/                   historical similarity scoring and search
+  ai/gemini.ts                  Gemini client (server-side only)
+  risk/                         evidence bundle, validation, risk analysis, automatic scheduling
+  pipeline/                     shared push ingestion and deployment lifecycle
+  hindsight/                    Hindsight client and memory builders (deployment, incident, risk)
+  dashboard/dashboard-data.ts   read-only data for the dashboard
+  maintenance/run.ts            the maintenance / recovery run
+db/migrations/                  001 … 008, additive and re-runnable (`npm run db:migrate`)
 scripts/
   send-test-webhook.mjs         signed fake push, for local testing
   report-status.mjs             run by GitHub Actions to report BUILDING/SUCCESS/FAILED
-  verify-phase3.mjs             local end-to-end check of the status flow
+  verify-phase*.mjs             local end-to-end checks, one per phase (`npm run verify:phaseN`)
 tests/                          unit tests, run by `npm test` locally and in CI
 .github/workflows/
   deployguard-ci.yml            install -> test -> build -> simulated deploy
+  deployguard-maintenance.yml   hourly call to the maintenance run
 ```
 
 ---
@@ -348,3 +439,5 @@ tests/                          unit tests, run by `npm test` locally and in CI
 - Secrets live only in `.env.local`, which is gitignored. Nothing is hardcoded.
 - Every delivery is verified with HMAC-SHA256 over the **raw** request body, compared using
   a timing-safe comparison. Unsigned or wrongly-signed requests get `401` and are never parsed.
+t e s t  
+ 
